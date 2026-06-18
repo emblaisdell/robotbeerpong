@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Robot Beer Pong</title>
+  <style>
+    :root { --bg:#10131a; --panel:#181c26; --ink:#e8edf6; --muted:#8a93a6; --accent:#5b8cff; --warn:#ff6b6b; --good:#3ddc97; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+    #app { display: grid; grid-template-columns: 320px 1fr; height: 100vh; }
+    #sidebar { background: var(--panel); border-right: 1px solid #0008; padding: 16px; overflow-y: auto; }
+    #stage { position: relative; }
+    #canvas { position: absolute; inset: 0; }
+    h1 { font-size: 18px; margin: 0 0 2px; letter-spacing: 0.5px; }
+    .sub { color: var(--muted); font-size: 11px; margin-bottom: 16px; }
+    .group { margin-bottom: 16px; }
+    label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+    select, button { width: 100%; font-family: inherit; font-size: 13px; padding: 8px 10px;
+      background: #222838; color: var(--ink); border: 1px solid #333b4d; border-radius: 6px; cursor: pointer; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #08101f; font-weight: 700; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    .row { display: flex; gap: 8px; }
+    .row > * { flex: 1; }
+    .blurb { font-size: 10px; color: var(--muted); margin-top: 4px; min-height: 26px; }
+    .scoreboard { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+    .card { background: #1f2533; border: 1px solid #2c3346; border-radius: 8px; padding: 10px; }
+    .card.turn { outline: 2px solid var(--accent); }
+    .card h3 { margin: 0 0 6px; font-size: 13px; }
+    .card .who { color: var(--muted); font-size: 10px; }
+    .cups { display: flex; flex-wrap: wrap; gap: 3px; margin: 6px 0; }
+    .pip { width: 12px; height: 12px; border-radius: 50%; background: #3ddc97; }
+    .pip.gone { background: #333b4d; }
+    .drinks { font-size: 11px; color: var(--warn); }
+    .drinks .sober { color: var(--muted); }
+    #log { font-size: 11px; line-height: 1.5; color: var(--muted); white-space: pre-wrap;
+      background: #11151d; border: 1px solid #222838; border-radius: 6px; padding: 8px; height: 200px; overflow-y: auto; }
+    #log b { color: var(--ink); }
+    #log .sink { color: var(--good); }
+    #log .fizzle { color: var(--warn); }
+    .speed { display: flex; gap: 6px; }
+    .speed button.active { background: var(--accent); color: #08101f; border-color: var(--accent); }
+    #banner { position: absolute; top: 20px; left: 50%; transform: translateX(-50%); z-index: 5;
+      background: #000a; border: 1px solid #2c3346; border-radius: 10px; padding: 10px 18px; font-size: 14px;
+      pointer-events: none; opacity: 0; transition: opacity 0.25s; }
+    #banner.show { opacity: 1; }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <h1>🤖🍺 Robot Beer Pong</h1>
+      <div class="sub">Two bare-metal RISC-V robots play beer pong. Losing cups gets you drunk — and drunk robots throw worse.</div>
+
+      <div class="scoreboard">
+        <div class="card" id="cardA">
+          <h3>Robot A <span class="who" id="whoA"></span></h3>
+          <div class="cups" id="cupsA"></div>
+          <div class="drinks" id="drinksA"></div>
+        </div>
+        <div class="card" id="cardB">
+          <h3>Robot B <span class="who" id="whoB"></span></h3>
+          <div class="cups" id="cupsB"></div>
+          <div class="drinks" id="drinksB"></div>
+        </div>
+      </div>
+
+      <div class="group">
+        <label>Robot A — strategy</label>
+        <select id="selA"></select>
+        <div class="blurb" id="blurbA"></div>
+      </div>
+      <div class="group">
+        <label>Robot B — strategy</label>
+        <select id="selB"></select>
+        <div class="blurb" id="blurbB"></div>
+      </div>
+
+      <div class="group row">
+        <button class="primary" id="btnPlay">▶ Play match</button>
+        <button id="btnStep">Step</button>
+      </div>
+      <div class="group">
+        <label>Speed</label>
+        <div class="speed" id="speed">
+          <button data-s="0.5">0.5×</button>
+          <button data-s="1" class="active">1×</button>
+          <button data-s="2">2×</button>
+          <button data-s="4">4×</button>
+        </div>
+      </div>
+
+      <div class="group">
+        <label>Play-by-play</label>
+        <div id="log"></div>
+      </div>
+      <div class="sub">Tip: drag to orbit, scroll to zoom. Each throw is real RV32IM machine code executed in your browser.</div>
+    </aside>
+
+    <main id="stage">
+      <div id="canvas"></div>
+      <div id="banner"></div>
+    </main>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module" src="src/main.js"></script>
+</body>
+</html>
