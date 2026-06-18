@@ -116,11 +116,16 @@ The launch turns `(yaw, pitch, power)` into a velocity and the ball flies under
 power ≈ isqrt( gravity × range )        # then trimmed for launch height
 ```
 
-The reference **Sniper** uses `power = isqrt(gravity × range × 737 / 1000)`,
-where the `0.737` folds in the launch-height correction found by
-[`tools/calibrate.mjs`](../tools/calibrate.mjs). Integer `isqrt` is a dozen
-instructions (see Sniper's `scan:`/`body:` loop). The **Lobber** skips the sqrt
-with a linear fit `power = range × 396 / 1000 + 1189`.
+The reference **Sniper** uses `power = isqrt(gravity × range × 785 / 1000)`,
+where the `0.785` folds in the launch-height correction calibrated against the
+rigid-body simulation by [`tools/test-physics.mjs`](../tools/test-physics.mjs).
+Integer `isqrt` is a dozen instructions (see Sniper's `scan:`/`body:` loop). The
+**Lobber** skips the sqrt with a linear fit `power = range × 329 / 1000 + 1549`.
+
+The shot is resolved by a real rigid-body simulation: the ball is a sphere that
+collides with cup-shaped colliders, bounces off rims, and a cup is *made* only
+when the ball comes to rest inside it. So "land it at the cup" really means
+"drop it through the mouth" — a hair short and you clank off the rim.
 
 ---
 

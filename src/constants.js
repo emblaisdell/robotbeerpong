@@ -61,6 +61,39 @@ export const COURT = {
   cupMouthHeight: 2.2,  // world units; cup rim height above table
 };
 
+// Rigid-body cup model. Each cup is a dynamic compound collider that matches
+// the fitted cup mesh: a solid base, a flat inner floor the ball rests on, and
+// a ring of wall boxes forming the open cone. Dimensions are world units for a
+// cup fitted to height (cupMouthHeight + 0.4) — see view.js _fitAndGround.
+export const CUP_PHYS = {
+  rimY: 2.55,          // rim height (open top)
+  floorY: 1.25,        // inner cavity floor height (ball rests here)
+  innerR: 0.95,        // cavity (inner wall) radius
+  outerR: 1.45,        // rim outer radius (matches the mesh rim)
+  baseR: 0.78,         // foot radius of the solid lower body
+  wallSegments: 12,    // boxes around the wall ring
+  mass: 0.05,          // light plastic cup
+  linearDamping: 0.4,
+  angularDamping: 0.5,
+};
+
+// Ball rigid body (a ping-pong ball: light + lively).
+export const BALL_PHYS = {
+  mass: 0.008,
+  restitution: 0.55,   // bounce off rims/table
+  friction: 0.35,
+};
+
+// Contact tuning + when a ball counts as "settled in a cup".
+export const PHYS = {
+  fixedDt: 1 / 120,    // physics step
+  maxSteps: 1200,      // ~10 s guard per throw
+  restSpeed: 1.2,      // world u/s below which the ball is "at rest"
+  restFrames: 30,      // consecutive at-rest frames -> settled
+  cupRestitution: 0.3, // low, so rim shots drop in rather than bounce out
+  cupFriction: 0.5,
+};
+
 // Standard 6-cup rack (3-2-1 triangle) positions in a robot-local frame where
 // +z points across the table toward the opponent. Returned as {x, z} offsets
 // from the rack apex anchor. Row 0 (3 cups) is closest to the owner.

@@ -81,17 +81,16 @@ function drinkText(n) {
 }
 
 // ---- log ----
-function logTurn(ev) {
+function logTurn(ev, info) {
   const who = `Robot ${ev.thrower}`;
   const yaw = ((ev.command?.yawMrad || 0) / MRAD).toFixed(2);
   let line;
-  if (ev.fizzle) {
+  if (info.result === 'sink') {
+    line = `<span class="sink">● ${who} sinks cup ${info.cupIndex}! Robot ${info.victim} drinks.</span>`;
+  } else if (ev.fizzle) {
     line = `<span class="fizzle">✗ ${who} fumbled the ball (corrupted memory / crash, ${ev.corrupted} byte flips)</span>`;
-  } else if (ev.result === 'sink') {
-    line = `<span class="sink">● ${who} sinks cup ${ev.cupIndex}! Robot ${ev.victim} drinks.</span>`;
   } else {
-    const where = ev.result === 'offtable' ? 'off the table' : 'the table';
-    line = `<b>${who}</b> misses (lands on ${where}), aim ${yaw} rad`;
+    line = `<b>${who}</b> misses, aim ${yaw} rad`;
   }
   const drunk = ev.drinks > 0 ? `  [${ev.drinks}🍺]` : '';
   const div = document.createElement('div');
@@ -119,13 +118,16 @@ function newMatch() {
 
 function stepTurn(thenContinue) {
   if (match.winner || view.anim) return;
-  const ev = match.runTurn();
+  const ev = match.computeThrow();
   if (!ev) return;
-  logTurn(ev);
-  view.playTurn(ev, () => {
+  const liveCups = match.liveTargetCups();
+  // Physics (run in the view) decides the outcome; apply it when the ball rests.
+  view.playThrow(ev, liveCups, (outcome) => {
+    const info = match.applyOutcome(outcome);
+    logTurn(ev, info);
     renderScore();
-    if (ev.winner) {
-      banner(`🏆 Robot ${ev.winner} (${nameOf(ev.winner === 'A' ? match.robots.A.playerId : match.robots.B.playerId)}) wins!`, 4000);
+    if (info.winner) {
+      banner(`🏆 Robot ${info.winner} (${nameOf(info.winner === 'A' ? match.robots.A.playerId : match.robots.B.playerId)}) wins!`, 4000);
       running = false;
       ui.btnPlay.textContent = '↻ New match';
     } else if (running && thenContinue) {

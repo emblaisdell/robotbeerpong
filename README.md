@@ -91,16 +91,19 @@ src/constants.js      MMIO ABI, court layout, fixed-point units
 src/riscv.js          RV32IM interpreter + assembler
 src/players.js        the candidate RISC-V strategies (assembly)
 src/physics.js        pure ballistics + court geometry
+src/cupworld.js       rigid-body world (cannon-es): cup colliders + ball
 src/engine.js         headless match engine + inebriation penalties
 src/view.js           Three.js scene, model loading, animation
 src/main.js           UI wiring + render loop
 tools/                node test + calibration harnesses (no browser needed)
 ```
 
-Run the headless checks with:
+The browser needs no install (Three.js and cannon-es load from a CDN). The
+headless Node checks need the physics engine locally, so run `npm install` once,
+then:
 
 ```sh
 node tools/test-riscv.mjs    # CPU + assembler unit tests
-node tools/test-engine.mjs   # full matches, sober accuracy, termination
-node tools/calibrate.mjs     # re-derive the ballistics constant
+node tools/test-engine.mjs   # full matches (rigid-body physics), accuracy, termination
+node tools/test-physics.mjs  # cup collisions + re-derive the ballistics constant
 ```

@@ -1,14 +1,15 @@
-// Three.js rendering layer. Loads the GLB models, builds the court, and
-// animates the turn events produced by engine.js. It owns no game logic — it
-// is handed a fully-resolved throw (origin, velocity, trajectory, result) and
-// just makes it look good. Ball flight is recomputed from the same kinematics
-// the engine used, so what you see matches what was scored.
+// Three.js rendering layer. Loads the GLB models, builds the court, animates
+// the robot arms, and runs the rigid-body ball/cup simulation (CupWorld). The
+// physics it steps here *is* the authority on the outcome: the ball collides
+// with cup-shaped colliders, settles in, and the made cup is reported back so
+// the engine can score it.
 
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { COURT, GRAVITY, MRAD, BALL_RADIUS, LAUNCH_HEIGHT } from './constants.js';
+import { COURT, MRAD, BALL_RADIUS, LAUNCH_HEIGHT, PHYS } from './constants.js';
 import { rackPositions } from './physics.js';
+import { CupWorld } from './cupworld.js';
 
 const MODELS = {
   robot: 'web-models/robot.glb',
@@ -137,7 +138,7 @@ export class GameView {
     // remove previous
     for (const k of ['A', 'B']) if (this.robots[k]) this.scene.remove(this.robots[k].group);
     for (const side of ['-1', '1']) {
-      for (const m of this.cupMeshes[side]) this.scene.remove(m);
+      for (const m of this.cupMeshes[side]) if (m) this.scene.remove(m);
       this.cupMeshes[side] = [];
     }
 
@@ -192,9 +193,15 @@ export class GameView {
   _makeRack(side) {
     const cups = rackPositions(side);
     for (const c of cups) {
+      // Wrap the cup in a group whose origin sits at the cup's base centre,
+      // matching the physics body's frame so we can drive it rigidly.
+      const group = new THREE.Group();
+      group.position.set(c.x, 0, c.z);
+      group.userData = { side, index: c.index, home: { x: c.x, z: c.z } };
+
       const mesh = this.proto.cup.clone(true);
       this._fitAndGround(mesh, COURT.cupMouthHeight + 0.4, this.nativeSize.cup);
-      mesh.position.x = c.x; mesh.position.z = c.z;
+      mesh.position.x = 0; mesh.position.z = 0; // centred inside the group
       // The cup.glb is already authored as a red solo cup: a 2-colour palette
       // texture (red body, white rim/foot) drives the outside, so we leave the
       // texture alone. The only thing it can't express is the *inside* — the
@@ -226,24 +233,44 @@ export class GameView {
           o.material.needsUpdate = true;
         }
       });
-      mesh.userData = { side, index: c.index };
-      this.scene.add(mesh);
-      this.cupMeshes[String(side)][c.index] = mesh;
+      group.add(mesh);
+      this.scene.add(group);
+      this.cupMeshes[String(side)][c.index] = group;
     }
   }
 
-  // Start animating one engine turn. Calls done() when fully settled.
-  playTurn(event, done, speed = 1) {
+  // Reset every still-standing cup to its rack position (upright), undoing any
+  // knocks from the previous throw.
+  _resetCups() {
+    for (const side of ['-1', '1']) {
+      for (const g of this.cupMeshes[side]) {
+        if (g && !g.userData.dying) {
+          g.position.set(g.userData.home.x, 0, g.userData.home.z);
+          g.quaternion.identity();
+          g.scale.setScalar(1);
+        }
+      }
+    }
+  }
+
+  // Animate one throw. `liveCups` are the opponent's standing cups
+  // [{index,x,z}]; `done(outcome)` fires when the ball has settled, with the
+  // physics result { result:'sink'|'miss', cupIndex }.
+  playThrow(event, liveCups, done, speed = 1) {
     this.speed = speed;
     this.onTurnDone = done;
     const robot = event.thrower === 'A' ? this.robots.A : this.robots.B;
-    const flightTime = Math.max(0.2, (event.trajectory.length - 1) * (event.dt || 1 / 240));
-    // Aim the waist toward the commanded yaw (cosmetic).
     const yaw = (event.command?.yawMrad || 0) / MRAD;
+
+    // Reset knocked cups, then build the rigid-body world for this throw.
+    this._resetCups();
+    this.world = new CupWorld({ cups: liveCups });
+    this.oppSide = String(event.oppSide);
+
     this.anim = {
       event, robot, phase: 'windup', t: 0,
-      windup: 0.32, throwT: 0.16, flightTime, settle: 0.6,
-      yaw, ball: null, released: false,
+      windup: 0.32, throwT: 0.16, settle: 0.7,
+      yaw, released: false, physAccum: 0, outcome: null,
       prevMagQuat: null, spinAxis: null, spinRate: 0, // ball spin from the arm
     };
     // make the ball, then have the magnet hold it just beyond the arm tip
@@ -298,37 +325,44 @@ export class GameView {
     this.ball.position.copy(p).add(off);
   }
 
-  // The magnet lets go: from here the ball follows the ballistic trajectory.
-  // Its held rest position equals event.origin, so this hand-off is seamless.
-  _release() {
+  // The magnet lets go: hand the ball (with its spin) to the physics world.
+  // Its held rest position equals event.origin, so the hand-off is seamless.
+  _releasePhysics() {
     const a = this.anim;
     a.released = true;
-    a.phase = 'flight';
-    a.t = 0;
+    a.phase = 'physics';
+    a.physAccum = 0;
     this.ball.visible = true;
-    const o = a.event.origin;
-    this.ball.position.set(o.x, o.y, o.z);
+    const spin = a.spinAxis
+      ? { axis: { x: a.spinAxis.x, y: a.spinAxis.y, z: a.spinAxis.z }, rate: a.spinRate }
+      : null;
+    this.world.launch({ origin: a.event.origin, velocity: a.event.velocity, spin });
   }
 
-  _finishFlight() {
+  // Ball has come to rest: record the outcome, pop the made cup.
+  _finishPhysics() {
     const a = this.anim;
-    const ev = a.event;
-    if (ev.result === 'sink' && ev.sunkCup) {
-      const mesh = this.cupMeshes[String(ev.sunkCup.side)][ev.sunkCup.index];
-      if (mesh) this._splash(mesh);
+    a.outcome = this.world.outcome || { result: 'miss', cupIndex: -1 };
+    if (a.outcome.result === 'sink' && a.outcome.cupIndex >= 0) {
+      const g = this.cupMeshes[this.oppSide][a.outcome.cupIndex];
+      if (g) g.userData.dying = true;   // pull the made cup
       this.ball.visible = false;
-    } else {
-      // leave the ball where it landed for a beat
     }
     a.phase = 'settle';
     a.t = 0;
   }
 
-  // Pop a cup with a little particle splash + drop animation.
-  _splash(mesh) {
-    mesh.userData.dying = true;
-    mesh.userData.vy = 6 + Math.random() * 3;
-    mesh.userData.spin = (Math.random() - 0.5) * 8;
+  // Sync the Three.js meshes to the physics bodies.
+  _syncPhysics() {
+    const bs = this.world.ballState();
+    if (bs) { this.ball.position.set(bs.x, bs.y, bs.z); this.ball.quaternion.set(bs.qx, bs.qy, bs.qz, bs.qw); }
+    for (const cs of this.world.cupStates()) {
+      const g = this.cupMeshes[this.oppSide][cs.index];
+      if (g && !g.userData.dying) {
+        g.position.set(cs.x, cs.y, cs.z);
+        g.quaternion.set(cs.qx, cs.qy, cs.qz, cs.qw);
+      }
+    }
   }
 
   update() {
@@ -357,47 +391,53 @@ export class GameView {
         setSwing(-0.9 + 1.5 * k);                              // shoulder swings forward
         setElbow(-0.6 + 1.7 * (k * k));                        // elbow snaps late (whip)
         if (!a.released) { this._holdBall(r); this._trackSpin(r, a, dt); } // carried + spun up
-        if (k >= 0.6 && !a.released) this._release();
-        if (a.t >= a.throwT && !a.released) this._release();
-      } else if (a.phase === 'flight') {
-        const o = a.event.origin, v = a.event.velocity;
-        const t = a.t;
-        this.ball.position.set(o.x + v.x * t, o.y + v.y * t - 0.5 * GRAVITY * t * t, o.z + v.z * t);
-        // the ball keeps the spin it left the magnet with (slowly bleeding off)
-        if (a.spinAxis && a.spinRate > 0.01) {
-          this.ball.rotateOnWorldAxis(a.spinAxis, a.spinRate * dt);
-          a.spinRate *= (1 - Math.min(1, dt * 0.15)); // mild air drag
+        if (k >= 0.6 && !a.released) this._releasePhysics();
+        if (a.t >= a.throwT && !a.released) this._releasePhysics();
+      } else if (a.phase === 'physics') {
+        // Step the rigid-body world at a fixed rate (scaled by playback speed),
+        // syncing the ball + cup meshes to the bodies. Physics decides the rest.
+        a.physAccum += dt;
+        let guard = 0;
+        while (a.physAccum >= PHYS.fixedDt && !this.world.done && guard < 16) {
+          this.world.step();
+          a.physAccum -= PHYS.fixedDt;
+          guard++;
         }
-        // ease shoulder and elbow back to rest
+        this._syncPhysics();
+        // ease shoulder and elbow back to rest while the ball is airborne
         if (r.arm) r.arm.rotation.z += (restArmZ - r.arm.rotation.z) * Math.min(1, dt * 4);
         if (r.hand) r.hand.rotation.z += (restHandZ - r.hand.rotation.z) * Math.min(1, dt * 4);
-        if (t >= a.flightTime) this._finishFlight();
+        if (this.world.done) this._finishPhysics();
       } else if (a.phase === 'settle') {
         if (r.waist) r.waist.rotation.y += (0 - r.waist.rotation.y) * Math.min(1, dt * 5);
         if (r.arm) r.arm.rotation.z += (restArmZ - r.arm.rotation.z) * Math.min(1, dt * 5);
         if (r.hand) r.hand.rotation.z += (restHandZ - r.hand.rotation.z) * Math.min(1, dt * 5);
         if (a.t >= a.settle) {
           const cb = this.onTurnDone;
+          const outcome = a.outcome || { result: 'miss', cupIndex: -1 };
           this.anim = null; this.onTurnDone = null;
           if (this.ball) this.ball.visible = false;
-          if (cb) cb();
+          if (cb) cb(outcome);
         }
       }
     }
     this.renderer.render(this.scene, this.camera);
   }
 
+  // A made cup is pulled: it sinks into the table and shrinks away, then is
+  // removed so it no longer participates in physics or resets.
   _updateDyingCups(dt) {
     for (const side of ['-1', '1']) {
-      for (const mesh of this.cupMeshes[side]) {
-        if (mesh && mesh.userData.dying) {
-          mesh.userData.vy -= GRAVITY * dt;
-          mesh.position.y += mesh.userData.vy * dt;
-          mesh.rotation.z += mesh.userData.spin * dt;
-          mesh.scale.multiplyScalar(1 - dt * 0.6);
-          if (mesh.position.y < -8) {
-            this.scene.remove(mesh);
-            mesh.userData.dying = false;
+      const arr = this.cupMeshes[side];
+      for (let i = 0; i < arr.length; i++) {
+        const g = arr[i];
+        if (g && g.userData.dying) {
+          g.userData.dieT = (g.userData.dieT || 0) + dt;
+          g.position.y -= 7 * dt;                  // sink through the table
+          g.scale.multiplyScalar(1 - Math.min(0.9, dt * 3));
+          if (g.userData.dieT > 0.5) {
+            this.scene.remove(g);
+            arr[i] = null;
           }
         }
       }

@@ -1,0 +1,10 @@
+{
+  "name": "robotbeerpong",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Two bare-metal RISC-V robots play beer pong.",
+  "dependencies": {
+    "cannon-es": "0.20.0"
+  }
+}

@@ -11,7 +11,7 @@ import {
   S_BEARING, S_RANGE, S_DRINKS, S_YAW, S_PITCH, S_GRAVITY, S_RNG, S_CUPS,
   A_YAW, A_PITCH, A_POWER, A_FIRE, A_LOG, GRAVITY, MM_PER_UNIT,
 } from './constants.js';
-import { rackPositions, bearingRange, launchVelocity, simulate, originOf } from './physics.js';
+import { rackPositions, bearingRange, launchVelocity, originOf } from './physics.js';
 
 // Deterministic PRNG so a given seed replays identically.
 function mulberry32(seed) {
@@ -117,14 +117,16 @@ export class Match {
     return flipped;
   }
 
-  // Execute one throw and resolve it. Returns a rich event for the view.
-  runTurn() {
+  // Run the player and produce the *launch* for this turn. The outcome (which
+  // cup, if any) is decided later by the rigid-body simulation and fed back via
+  // applyOutcome — the physics is the authority on whether a cup is made.
+  computeThrow() {
     if (this.winner) return null;
     const robot = this.robots[this.current];
     const opponent = this.opponentOf(this.current);
     const drinks = robot.drinks;
 
-    // Pick the nearest live opponent cup to aim at.
+    // Pick the nearest live opponent cup to aim at (fills the bearing sensor).
     const origin = originOf(robot.side);
     const targets = opponent.aliveCups();
     let target = targets[0];
@@ -147,6 +149,7 @@ export class Match {
       turn: this.turnIndex,
       thrower: robot.label,
       side: robot.side,
+      oppSide: opponent.side,
       playerId: robot.playerId,
       drinks,
       origin,
@@ -154,65 +157,55 @@ export class Match {
       instr: ran,
       corrupted: flipped,
       log: cmd.logs.slice(),
-      winner: null,
     };
 
     if (!cmd.fired) {
-      // The program never pulled the trigger (corruption / infinite loop /
-      // crash). The arm twitches and fumbles the ball onto the table.
-      event.fizzle = true;
+      // The program never pulled the trigger (corruption / crash / infinite
+      // loop). The arm twitches and fumbles the ball — physics will miss.
       const yaw = Math.round(this.noise(400));
       const power = Math.round(600 + this.rand() * 400);
-      const vel = launchVelocity(robot.side, yaw, 300, power);
-      const sim = simulate(origin, vel, []);
+      event.fizzle = true;
       event.command = { yawMrad: yaw, pitchMrad: 300, power };
-      event.velocity = vel;
-      event.dt = 1 / 240;
-      event.trajectory = sim.points;
-      event.result = 'fizzle';
-      event.cupIndex = -1;
-      this.finishTurn(event);
+      event.velocity = launchVelocity(robot.side, yaw, 300, power);
       return event;
     }
 
-    // Apply actuator handicap: over/under-actuation (scale error) plus aim
-    // bias, both growing with drinks.
+    // Actuator handicap: over/under-actuation (scale error) plus aim bias.
     const yawMrad = Math.round(cmd.yaw * (1 + this.noise(0.02 * drinks)) + this.noise(20 * drinks));
     const pitchMrad = Math.round(cmd.pitch + this.noise(14 * drinks));
     const power = Math.max(0, Math.round(cmd.power * (1 + this.noise(0.05 * drinks))));
-
     event.intended = { yawMrad: cmd.yaw, pitchMrad: cmd.pitch, power: cmd.power };
     event.command = { yawMrad, pitchMrad, power };
-
-    const vel = launchVelocity(robot.side, yawMrad, pitchMrad, power);
-    event.velocity = vel;
-    const sim = simulate(origin, vel, opponent.aliveCups());
-    event.dt = 1 / 240;
-    event.trajectory = sim.points;
-    event.result = sim.result;
-    event.cupIndex = sim.cupIndex;
-    event.landing = sim.landing;
-
-    if (sim.result === 'sink' && sim.cupIndex >= 0) {
-      const cup = opponent.cups[sim.cupIndex];
-      cup.alive = false;
-      opponent.drinks += 1; // the victim drinks — and gets worse
-      event.sunkCup = { side: opponent.side, index: sim.cupIndex, x: cup.x, z: cup.z };
-      event.victim = opponent.label;
-    }
-
-    this.finishTurn(event);
+    event.velocity = launchVelocity(robot.side, yawMrad, pitchMrad, power);
     return event;
   }
 
-  finishTurn(event) {
+  // Apply the physics result to the score and advance the turn.
+  //   result: { result: 'sink' | 'miss', cupIndex }
+  applyOutcome(result) {
+    const robot = this.robots[this.current];
     const opponent = this.opponentOf(this.current);
-    if (opponent.defeated()) {
-      this.winner = this.current;
-      event.winner = this.current;
+    const info = { result: result.result, cupIndex: result.cupIndex, winner: null };
+
+    if (result.result === 'sink' && result.cupIndex >= 0) {
+      const cup = opponent.cups[result.cupIndex];
+      if (cup && cup.alive) {
+        cup.alive = false;
+        opponent.drinks += 1; // the victim drinks — and gets worse
+        info.sunkCup = { side: opponent.side, index: result.cupIndex, x: cup.x, z: cup.z };
+        info.victim = opponent.label;
+      }
     }
+
+    if (opponent.defeated()) { this.winner = this.current; info.winner = this.current; }
     this.turnIndex++;
     this.current = this.current === 'A' ? 'B' : 'A';
+    return info;
+  }
+
+  // Live opponent cups (rack positions + indices) for building the physics world.
+  liveTargetCups() {
+    return this.opponentOf(this.current).aliveCups().map((c) => ({ index: c.index, x: c.x, z: c.z }));
   }
 
   // Convenience snapshot for the UI.
