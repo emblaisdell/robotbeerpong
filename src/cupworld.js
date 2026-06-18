@@ -71,6 +71,25 @@ export class CupWorld {
     ground.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
     world.addBody(ground);
 
+    // Backstop: an invisible wall just in front of the *target* robot (behind
+    // its rack) so overshot balls stop there instead of phasing through the
+    // robot, which has no collider. Only on the opponent's side — a wall in
+    // front of the thrower would block its own launch. Low restitution so it
+    // deadens the ball rather than ricocheting it back across the table.
+    // The opponent's side (+1 / -1): the ball travels toward it.
+    this.oppSide = cups.length ? (Math.sign(cups[0].z) || 1) : 1;
+    this.backstopZ = COURT.robotZ - COURT.backstopInset;
+    if (cups.length) {
+      const oppSide = this.oppSide;
+      const wallMat = new CANNON.Material('wall');
+      world.addContactMaterial(new CANNON.ContactMaterial(ballMat, wallMat, { restitution: 0.1, friction: 0.5 }));
+      const hy = COURT.backstopHeight / 2;
+      const wall = new CANNON.Body({ mass: 0, material: wallMat });
+      wall.addShape(new CANNON.Box(new CANNON.Vec3(COURT.tableHalfWidth + 2, hy, 0.25)));
+      wall.position.set(0, hy, oppSide * (COURT.robotZ - COURT.backstopInset));
+      world.addBody(wall);
+    }
+
     this.ballMat = ballMat;
     this.cups = [];
     for (const c of cups) {
@@ -85,6 +104,7 @@ export class CupWorld {
     this.steps = 0;
     this.done = false;
     this.outcome = null;
+    this.inPlay = false; // true once the ball is between the two backstops
   }
 
   // Launch the ball. spin: optional { axis:{x,y,z}, rate } (rad/s).
@@ -108,9 +128,15 @@ export class CupWorld {
     const b = this.ball;
     if (!b) return 'flying';
 
-    // Off the table -> immediate miss.
-    if (Math.abs(b.position.x) > COURT.tableHalfWidth + 2 ||
-        Math.abs(b.position.z) > COURT.robotZ + 2 || b.position.y < -3) {
+    // Off the table sideways or below the floor -> miss.
+    if (Math.abs(b.position.x) > COURT.tableHalfWidth + 2 || b.position.y < -3) {
+      return this._finish('miss', -1);
+    }
+    // Once the ball has flown into the field (between the backstops), stop it if
+    // it then reaches *either* backstop plane — it never proceeds to a robot
+    // (which has no collider), whether overshooting forward or bouncing back.
+    if (!this.inPlay && Math.abs(b.position.z) < this.backstopZ) this.inPlay = true;
+    if (this.inPlay && Math.abs(b.position.z) >= this.backstopZ) {
       return this._finish('miss', -1);
     }
 

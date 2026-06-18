@@ -59,6 +59,8 @@ export const COURT = {
   cupScale: 0.7,        // scale applied to cup.glb
   cupCatchRadius: 1.9,  // world units; how close to cup centre counts as a sink
   cupMouthHeight: 2.2,  // world units; cup rim height above table
+  backstopInset: 8,     // world units in front of each robot for the backstop
+  backstopHeight: 32,   // tall enough that normal overshoots bounce off it
 };
 
 // Rigid-body cup model. Each cup is a dynamic compound collider that matches
