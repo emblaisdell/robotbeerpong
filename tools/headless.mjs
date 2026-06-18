@@ -91,6 +91,8 @@ function cdp(ws) {
     await send('Runtime.evaluate', { expression: process.env.EVAL });
     await sleep(500);
   }
+  const title = await evalJs('document.title');
+  if (title && title !== 'Robot Beer Pong') console.log('probe:', title);
   const { result: { data } } = await send('Page.captureScreenshot', { format: 'png' });
   writeFileSync(out, Buffer.from(data, 'base64'));
 

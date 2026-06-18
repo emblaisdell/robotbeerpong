@@ -26,7 +26,7 @@ const PITCH = 785;
 // ---------------------------------------------------------------------------
 // 1) SNIPER — honest ballistics.
 // Aims straight at the nearest cup's bearing and solves for launch speed:
-//   v = isqrt( g * range * 0.775 )     (the 0.775 folds in the launch-height
+//   v = isqrt( g * range * 0.737 )     (the 0.737 folds in the launch-height
 // correction found by tools/calibrate.mjs). Integer sqrt is done bit-by-bit.
 // Deadly when sober; its precision is exactly what inebriation noise wrecks.
 // ---------------------------------------------------------------------------
@@ -39,8 +39,8 @@ start:
     li   t0, S_GRAVITY
     lw   s3, 0(t0)          # s3 = gravity (mm/s^2)
 
-    # a0 = g * range * 775 / 1000   (ordered to avoid 32-bit overflow)
-    li   t1, 775
+    # a0 = g * range * 737 / 1000   (ordered to avoid 32-bit overflow)
+    li   t1, 737
     mul  a0, s2, t1
     li   t1, 1000
     div  a0, a0, t1
@@ -87,7 +87,7 @@ done:
 // ---------------------------------------------------------------------------
 // 2) LOBBER — cheap linear model.
 // No sqrt: approximates launch speed with a straight line fit to the rack,
-//   v = range * 394/1000 + 1277.
+//   v = range * 396/1000 + 1189.
 // Accurate near the middle of the rack, a touch off at the extremes — a
 // pragmatic engineer's robot. Still aims at the true bearing.
 // ---------------------------------------------------------------------------
@@ -98,11 +98,11 @@ start:
     li   t0, S_RANGE
     lw   s2, 0(t0)
 
-    li   t1, 394
+    li   t1, 396
     mul  a0, s2, t1
     li   t1, 1000
     div  a0, a0, t1
-    li   t1, 1277
+    li   t1, 1189
     add  a0, a0, t1        # a0 = power
 
     li   t0, A_YAW
@@ -137,7 +137,7 @@ start:
     li   t1, ${PITCH}
     sw   t1, 0(t0)
     li   t0, A_POWER
-    li   t1, 3120          # fixed, tuned for the middle of the rack
+    li   t1, 3090          # fixed, tuned for the middle of the rack
     sw   t1, 0(t0)
     li   t0, A_FIRE
     li   t1, 1

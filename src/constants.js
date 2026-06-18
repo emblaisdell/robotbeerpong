@@ -43,7 +43,8 @@ export const A_LOG     = MMIO_BASE + 0x30; // write a value -> appears in the de
 // exposed to players via S_GRAVITY for honest ballistics.
 export const GRAVITY = 26;            // world units / s^2 (downward)
 export const BALL_RADIUS = 0.45;      // world units (ball.glb is ~radius 0.45)
-export const LAUNCH_HEIGHT = 14;      // world units, height the ball leaves the hand
+export const LAUNCH_HEIGHT = 17;      // world units; matches the magnet tip where
+                                      // the ball is held, so release is seamless
 
 // --- Court layout ------------------------------------------------------------
 // A long table along +Z. Robot A stands at -Z and throws toward +Z; Robot B

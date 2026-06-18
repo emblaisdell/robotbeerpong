@@ -63,7 +63,8 @@ real bare-metal robot would:
 | `S_DRINKS`, `S_RNG`, `S_CUPS`, … | | `A_FIRE` | store 1 → throw |
 
 The ABI lives in `src/constants.js` (single source of truth for both the asm and
-the sim).
+the sim), and is documented for player authors in
+[docs/robot-isa.md](docs/robot-isa.md).
 
 **Inebriation.** You score by sinking your *opponent's* cups, which makes the
 *opponent* drink — so the loser snowballs. Drinks (in `src/engine.js`) corrupt

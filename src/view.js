@@ -7,7 +7,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { COURT, GRAVITY, MRAD, BALL_RADIUS } from './constants.js';
+import { COURT, GRAVITY, MRAD, BALL_RADIUS, LAUNCH_HEIGHT } from './constants.js';
 import { rackPositions } from './physics.js';
 
 const MODELS = {
@@ -154,15 +154,38 @@ export class GameView {
     this._fitAndGround(model, 16, this.nativeSize.robot);
     group.add(model);
     group.position.set(0, 0, side * COURT.robotZ);
-    // Face centre court. Robot A (-Z) looks toward +Z, robot B toward -Z.
-    group.rotation.y = side < 0 ? 0 : Math.PI;
+    // The model's "front" is its local +X, so yaw it a quarter turn to face the
+    // opponent down the court (A at -Z looks toward +Z, B at +Z toward -Z).
+    group.rotation.y = side < 0 ? -Math.PI / 2 : Math.PI / 2;
 
-    // Find articulated nodes for cosmetic aiming/swing.
+    // Find articulated nodes for cosmetic aiming/swing. With the body turned,
+    // the shoulder now swings about the arm's local Z to throw down the court.
     const waist = model.getObjectByName('Waist');
     const arm = model.getObjectByName('Arm');
+    const hand = model.getObjectByName('Hand');
     const magnet = model.getObjectByName('Magnet');
-    const robot = { group, model, side, waist, arm, magnet, baseArmX: arm ? arm.rotation.x : 0, baseYaw: 0 };
+    const robot = {
+      group, model, side, waist, arm, hand, magnet, baseYaw: 0,
+      baseArmZ: arm ? arm.rotation.z : 0,
+      baseHandZ: hand ? hand.rotation.z : 0,
+      // B is A turned 180°, so the same swing sign carries both hands toward
+      // their own opponent's cups.
+      swingSign: -1,
+    };
     this.scene.add(group);
+    // Measure where the magnet tip rests so the held ball sits a fixed amount
+    // *beyond* it and the ball's rest height equals the physics LAUNCH_HEIGHT
+    // (making release seamless).
+    group.updateMatrixWorld(true);
+    if (magnet) {
+      const p = new THREE.Vector3();
+      magnet.getWorldPosition(p);
+      robot.magnetRestY = p.y;
+      robot.ballBeyond = LAUNCH_HEIGHT - p.y; // local +Y offset along the arm tip
+    } else {
+      robot.magnetRestY = LAUNCH_HEIGHT;
+      robot.ballBeyond = 0;
+    }
     return robot;
   }
 
@@ -172,12 +195,35 @@ export class GameView {
       const mesh = this.proto.cup.clone(true);
       this._fitAndGround(mesh, COURT.cupMouthHeight + 0.4, this.nativeSize.cup);
       mesh.position.x = c.x; mesh.position.z = c.z;
-      // Classic red solo cup.
+      // The cup.glb is already authored as a red solo cup: a 2-colour palette
+      // texture (red body, white rim/foot) drives the outside, so we leave the
+      // texture alone. The only thing it can't express is the *inside* — the
+      // cup is a single-walled shell, so the interior shares the body's red UV.
+      // We override just the inner-facing faces (and cavity floor) to white in
+      // the shader, leaving the authored lip exactly as modelled.
       mesh.traverse((o) => {
         if (o.isMesh) {
           o.material = o.material.clone();
-          o.material.color = new THREE.Color(0xd63031);
-          o.material.emissive = new THREE.Color(0x3a0a0a);
+          o.material.onBeforeCompile = (shader) => {
+            shader.vertexShader = 'varying vec3 vLocalPos;\nvarying vec3 vLocalNormal;\n' + shader.vertexShader
+              .replace('#include <begin_vertex>', '#include <begin_vertex>\n  vLocalPos = position;')
+              .replace('#include <beginnormal_vertex>', '#include <beginnormal_vertex>\n  vLocalNormal = objectNormal;');
+            shader.fragmentShader = 'varying vec3 vLocalPos;\nvarying vec3 vLocalNormal;\n' + shader.fragmentShader
+              .replace('#include <color_fragment>',
+                ['#include <color_fragment>',
+                  '{',
+                  // Radial component of the (un-normalized) surface normal: clearly
+                  // negative only on inner-facing walls. Not normalizing the normal
+                  // avoids noise on the near-vertical rim/ridge faces.
+                  '  float radial = dot(vLocalNormal.xz, normalize(vLocalPos.xz + 1e-5));',
+                  '  bool inside = radial < -0.25;',
+                  // The cavity floor: upward-facing faces near the central axis.
+                  '  bool floor = vLocalNormal.y > 0.5 && length(vLocalPos.xz) < 1.0;',
+                  '  if (inside || floor) diffuseColor.rgb = vec3(0.95, 0.96, 0.97);',
+                  '}'].join('\n  '));
+          };
+          o.material.customProgramCacheKey = () => 'cup-white-inside';
+          o.material.needsUpdate = true;
         }
       });
       mesh.userData = { side, index: c.index };
@@ -198,17 +244,62 @@ export class GameView {
       event, robot, phase: 'windup', t: 0,
       windup: 0.32, throwT: 0.16, flightTime, settle: 0.6,
       yaw, ball: null, released: false,
+      prevMagQuat: null, spinAxis: null, spinRate: 0, // ball spin from the arm
     };
-    // make/reset the flying ball
+    // make the ball, then have the magnet hold it just beyond the arm tip
     if (!this.ball) {
       this.ball = this.proto.ball.clone(true);
       this.ball.scale.setScalar((BALL_RADIUS * 2) / this.nativeSize.ball.y);
-      this.ball.traverse((o) => { if (o.isMesh) { o.material = o.material.clone(); o.material.color = new THREE.Color(0xffffff); o.material.emissive = new THREE.Color(0x222222); } });
+      // flat shading so the icosphere facets catch the light and the spin reads
+      this.ball.traverse((o) => {
+        if (o.isMesh) {
+          o.material = o.material.clone();
+          o.material.color = new THREE.Color(0xffffff);
+          o.material.emissive = new THREE.Color(0x202020);
+          o.material.flatShading = true;
+          o.material.needsUpdate = true;
+        }
+      });
       this.scene.add(this.ball);
     }
-    this.ball.visible = false;
+    this.ball.rotation.set(0, 0, 0);   // fresh orientation each throw
+    this.ball.visible = true;
+    this._holdBall(robot);
   }
 
+  // Measure the magnet's angular velocity (world frame) from its rotation over
+  // one frame — the spin the ball will inherit when the magnet lets go.
+  _trackSpin(r, a, dt) {
+    if (!r.magnet) return;
+    const cur = new THREE.Quaternion();
+    r.magnet.getWorldQuaternion(cur);
+    if (a.prevMagQuat && dt > 1e-5) {
+      const dq = cur.clone().multiply(a.prevMagQuat.clone().invert()).normalize();
+      const w = Math.min(1, Math.max(-1, dq.w));
+      const angle = 2 * Math.acos(Math.abs(w));
+      const s = Math.sqrt(Math.max(0, 1 - w * w));
+      if (s > 1e-4 && angle > 1e-5) {
+        const sign = w < 0 ? -1 : 1;
+        a.spinAxis = new THREE.Vector3(dq.x / s, dq.y / s, dq.z / s).multiplyScalar(sign).normalize();
+        a.spinRate = Math.min(45, angle / dt); // clamp to a sane visual max
+      }
+    }
+    a.prevMagQuat = cur.clone();
+  }
+
+  // Place the ball just beyond the magnet, tracking the arm as it swings.
+  _holdBall(r) {
+    if (!r.magnet) return;
+    const p = new THREE.Vector3();
+    const q = new THREE.Quaternion();
+    r.magnet.getWorldPosition(p);
+    r.magnet.getWorldQuaternion(q);
+    const off = new THREE.Vector3(0, r.ballBeyond, 0).applyQuaternion(q);
+    this.ball.position.copy(p).add(off);
+  }
+
+  // The magnet lets go: from here the ball follows the ballistic trajectory.
+  // Its held rest position equals event.origin, so this hand-off is seamless.
   _release() {
     const a = this.anim;
     a.released = true;
@@ -249,26 +340,42 @@ export class GameView {
     if (a) {
       a.t += dt;
       const r = a.robot;
+      // Swing angles s: 0 rest, <0 wound back, >0 thrown forward (toward cups).
+      // The shoulder (arm) leads; the elbow (hand) lags then snaps for a whip.
+      const setSwing = (s) => { if (r.arm) r.arm.rotation.z = r.baseArmZ + r.swingSign * s; };
+      const setElbow = (s) => { if (r.hand) r.hand.rotation.z = r.baseHandZ + r.swingSign * s; };
+      const restArmZ = r.baseArmZ, restHandZ = r.baseHandZ;
       if (a.phase === 'windup') {
         const k = Math.min(1, a.t / a.windup);
         if (r.waist) r.waist.rotation.y = a.yaw * (r.side < 0 ? 1 : -1) * k;
-        if (r.arm) r.arm.rotation.x = r.baseArmX - 0.9 * k;     // wind back
+        setSwing(-0.9 * k);                                    // shoulder winds back
+        setElbow(-0.6 * k);                                    // elbow cocks back
+        this._holdBall(r); this._trackSpin(r, a, dt);         // magnet still holds it
         if (a.t >= a.windup) { a.phase = 'throw'; a.t = 0; }
       } else if (a.phase === 'throw') {
         const k = Math.min(1, a.t / a.throwT);
-        if (r.arm) r.arm.rotation.x = r.baseArmX - 0.9 + 1.5 * k; // swing forward
+        setSwing(-0.9 + 1.5 * k);                              // shoulder swings forward
+        setElbow(-0.6 + 1.7 * (k * k));                        // elbow snaps late (whip)
+        if (!a.released) { this._holdBall(r); this._trackSpin(r, a, dt); } // carried + spun up
         if (k >= 0.6 && !a.released) this._release();
         if (a.t >= a.throwT && !a.released) this._release();
       } else if (a.phase === 'flight') {
         const o = a.event.origin, v = a.event.velocity;
         const t = a.t;
         this.ball.position.set(o.x + v.x * t, o.y + v.y * t - 0.5 * GRAVITY * t * t, o.z + v.z * t);
-        // ease the arm back to rest
-        if (r.arm) r.arm.rotation.x += (r.baseArmX - r.arm.rotation.x) * Math.min(1, dt * 4);
+        // the ball keeps the spin it left the magnet with (slowly bleeding off)
+        if (a.spinAxis && a.spinRate > 0.01) {
+          this.ball.rotateOnWorldAxis(a.spinAxis, a.spinRate * dt);
+          a.spinRate *= (1 - Math.min(1, dt * 0.15)); // mild air drag
+        }
+        // ease shoulder and elbow back to rest
+        if (r.arm) r.arm.rotation.z += (restArmZ - r.arm.rotation.z) * Math.min(1, dt * 4);
+        if (r.hand) r.hand.rotation.z += (restHandZ - r.hand.rotation.z) * Math.min(1, dt * 4);
         if (t >= a.flightTime) this._finishFlight();
       } else if (a.phase === 'settle') {
         if (r.waist) r.waist.rotation.y += (0 - r.waist.rotation.y) * Math.min(1, dt * 5);
-        if (r.arm) r.arm.rotation.x += (r.baseArmX - r.arm.rotation.x) * Math.min(1, dt * 5);
+        if (r.arm) r.arm.rotation.z += (restArmZ - r.arm.rotation.z) * Math.min(1, dt * 5);
+        if (r.hand) r.hand.rotation.z += (restHandZ - r.hand.rotation.z) * Math.min(1, dt * 5);
         if (a.t >= a.settle) {
           const cb = this.onTurnDone;
           this.anim = null; this.onTurnDone = null;
