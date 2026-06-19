@@ -162,7 +162,9 @@ shwrite:
     j    loop
 `;
 
-// SNIPER — honest inverse ballistics: v = isqrt(g*range*1020/1000).
+// SNIPER — honest inverse ballistics: v = isqrt(g*range*1830/1000). The 1830
+// factor (vs the ~1020 of a flat lob) puts the tip speed high enough that the
+// arc clears the front cups and drops *directly* into the target at ~40°.
 const SNIPER = `
 start:
     li   t0, S_RANGE
@@ -174,7 +176,7 @@ start:
     li   t0, S_BEARING
     lw   s2, 0(t0)          # yawTarget = bearing
 
-    li   t1, 1080
+    li   t1, 1830
     mul  a0, s4, t1
     li   t1, 1000
     div  a0, a0, t1
@@ -187,18 +189,19 @@ ${ISQRT}
 ${LOOP}
 `;
 
-// LOBBER — cheap linear tip-speed model (no sqrt): wstar = range*302/1000 + 1417.
+// LOBBER — cheap linear tip-speed model (no sqrt): wstar = range*392/1000 + 1847.
+// A linear fit to Sniper's direct-arc target ang-velocities (no isqrt needed).
 const LOBBER = `
 start:
     li   t0, S_RANGE
     lw   s4, 0(t0)
     li   t0, S_BEARING
     lw   s2, 0(t0)
-    li   t1, 302
+    li   t1, 392
     mul  a0, s4, t1
     li   t1, 1000
     div  a0, a0, t1
-    li   t1, 1417
+    li   t1, 1847
     add  s1, a0, t1         # wstar (linear)
     li   s0, 0
 ${LOOP}
@@ -211,7 +214,7 @@ start:
     lw   t1, 0(t0)
     andi t1, t1, 255
     addi s2, t1, -128       # yawTarget = -128..127 mrad jitter
-    li   s1, 2780           # fixed wstar
+    li   s1, 2780           # fixed wstar (lobs short of a clean direct arc)
     li   s0, 0
 ${LOOP}
 `;
@@ -244,12 +247,12 @@ start:
     lw   s2, 0(t0)          # s2 = yaw target = bearing to the nearest cup
 
     li   t0, S_RANGE        # pick shoulder swing speed from the range (linear):
-    lw   t1, 0(t0)          #   wstar = range*302/1000 + 1417   (mrad/s)
-    li   t3, 302
+    lw   t1, 0(t0)          #   wstar = range*392/1000 + 1847   (mrad/s)
+    li   t3, 392
     mul  t1, t1, t3
     li   t3, 1000
     div  t1, t1, t3
-    li   t3, 1417
+    li   t3, 1847
     add  s1, t1, t3         # s1 = target shoulder angular velocity
 
     li   s0, 0              # s0 = phase: 0 wind back, 1 swing, 2 follow through

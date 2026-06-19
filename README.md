@@ -89,8 +89,13 @@ they pick the target speed:
 - **Lobber** - a cheap linear tip-speed model (no sqrt). Sturdy and pragmatic.
 - **YOLO** - fixed swing speed, random aim. The control group; chaotic once drunk.
 
-Sniper and Lobber clear a 6-cup rack in 6 throws when sober (verified), and
-Sniper's precision beats Lobber head-to-head.
+Sniper and Lobber throw **direct** - a high arc that clears the front cups and
+drops straight in, no bank shot (YOLO lobs shorter and scatters). That's the
+hard way: the landing window for a full-table throw into a cup mouth is tiny, so
+even sober they sink ~3-4 of 6 and miss the rest. The misses are the point - you
+score by sinking the *opponent's* cups, the loser drinks and gets shakier, and
+the snowball resolves every match (verified: all pairings terminate). Sniper's
+tighter ballistics beat Lobber head-to-head.
 
 ## Layout
 

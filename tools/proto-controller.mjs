@@ -9,7 +9,7 @@
 // Run: node tools/proto-controller.mjs
 import { Arm, ARM } from '../src/arm.js';
 import { CupWorld } from '../src/cupworld.js';
-import { GRAVITY, MM_PER_UNIT, CTRL } from '../src/constants.js';
+import { GRAVITY, MM_PER_UNIT, CTRL, COURT } from '../src/constants.js';
 import { rackPositions, bearingRange, originOf } from '../src/physics.js';
 
 const isqrt = (n) => { let x = Math.floor(Math.sqrt(Math.max(0, n))); while (x * x > n) x--; while ((x + 1) * (x + 1) <= n) x++; return x; };
@@ -64,10 +64,21 @@ function throwAt(cup, p) {
   if (!release) return { result: 'nofire', wstar: lastWstar };
   const w = new CupWorld({ cups: rackPositions(+1).map((c) => ({ index: c.index, x: c.x, z: c.z })) });
   w.launch({ origin: release.tip, velocity: release.vel, spin: release.spin });
-  const r = w.resolve();
+  // Step manually so we can tell a DIRECT drop from a table-bounce: a direct
+  // shot enters a cup mouth without the ball ever touching the table first.
+  let touchedTable = false, direct = false;
+  while (!w.done && w.steps < 1200) {
+    w.step();
+    const b = w.ballState();
+    if (!b) break;
+    const overCup = Math.abs(b.x) <= COURT.tableHalfWidth && b.z >= 12 && b.z <= 22;
+    if (b.y < 0.7 && !overCup) touchedTable = true;                 // bounced on the open table
+    if (!touchedTable && b.y < 2.2 && b.z >= 12) direct = true;     // arrived into the cup zone, descending, no bounce
+  }
+  const r = w.outcome || { result: 'miss', cupIndex: -1 };
   const speed = Math.hypot(release.vel.x, release.vel.y, release.vel.z);
   const elev = Math.atan2(release.vel.y, Math.hypot(release.vel.x, release.vel.z)) * 180 / Math.PI;
-  return { ...r, speed: speed.toFixed(1), elev: elev.toFixed(0), ticks: release.ticks, wstar: lastWstar };
+  return { ...r, direct, speed: speed.toFixed(1), elev: elev.toFixed(0), ticks: release.ticks, wstar: lastWstar };
 }
 
 const cups = rackPositions(+1);
@@ -76,17 +87,18 @@ const base = {
   windback: -1450, releaseAngle: -785, cock: 1100,
 };
 
-// 2-D sweep over release angle (arc height) x FRAC (speed) for the gated swing.
+// Fine FRAC sweep for DIRECT 6/6 at the 45° release.
 let best = null;
-for (const releaseAngle of [-740, -800, -860, -920, -980]) {
-  for (let FRAC = 1000; FRAC <= 1360; FRAC += 20) {
-    let sunk = 0;
-    for (const c of cups) { const r = throwAt(c, { ...base, releaseAngle, FRAC }); if (r.result === 'sink' && r.cupIndex === c.index) sunk++; }
-    if (!best || sunk > best.sunk) { best = { releaseAngle, FRAC, sunk }; }
+for (let FRAC = 1650; FRAC <= 2050; FRAC += 15) {
+  let direct = 0;
+  for (const c of cups) {
+    const r = throwAt(c, { ...base, FRAC });
+    if (r.result === 'sink' && r.cupIndex === c.index && r.direct) direct++;
   }
+  if (!best || direct > best.direct) best = { releaseAngle: base.releaseAngle, FRAC, direct };
 }
-console.log(`best releaseAngle=${best.releaseAngle} FRAC=${best.FRAC} settles ${best.sunk}/6`);
+console.log(`best releaseAngle=${best.releaseAngle} FRAC=${best.FRAC}: ${best.direct}/6 direct`);
 for (const c of cups) {
   const r = throwAt(c, { ...base, releaseAngle: best.releaseAngle, FRAC: best.FRAC });
-  console.log(`  cup ${c.index}: ${r.result} cup=${r.cupIndex} speed=${r.speed} elev=${r.elev}° ticks=${r.ticks}`);
+  console.log(`  cup ${c.index}: ${r.result} cup=${r.cupIndex} direct=${r.direct} speed=${r.speed} elev=${r.elev}° ticks=${r.ticks}`);
 }
