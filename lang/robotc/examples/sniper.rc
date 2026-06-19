@@ -1,0 +1,78 @@
+// sniper.rc — RobotC port of the hand-written SNIPER (src/players.js).
+//
+// Honest inverse ballistics: solve the launch tip-speed from the range with an
+// integer square root (written below in RobotC itself), map it to a target
+// shoulder angular velocity via the arm length, then run the shared PD swing.
+// Compiles to assembly behaviourally identical to the hand version.
+
+const int WINDBACK      = -1450;
+const int RELEASE_ANGLE = -785;
+const int ELBOW_COCK    = 1100;   // elbow bend during wind-up; straight by release
+
+int phase;       // shoulder state machine: 0 wind, 1 swing, 2 done
+int wstar;       // target shoulder angular velocity (mrad/s)
+int yawTarget;   // bearing to the nearest cup, latched at turn start
+
+// Integer square root, bit-by-bit (matches the Sniper's scan/body loop).
+int isqrt(int n) {
+    int res = 0;
+    int bit = 0x40000000;
+    while (bit > n) bit = bit >> 2;
+    while (bit != 0) {
+        if (n >= res + bit) {
+            n = n - res - bit;
+            res = (res >> 1) + bit;
+        } else {
+            res = res >> 1;
+        }
+        bit = bit >> 2;
+    }
+    return res;
+}
+
+void main() {
+    int range   = read(S_RANGE);
+    int gravity = read(S_GRAVITY);
+    int armlen  = read(S_ARMLEN);
+    yawTarget   = read(S_BEARING);
+
+    // v = isqrt(gravity * range * 1080/1000);  wstar = v*1000/armlen
+    int v = isqrt(range * 1080 / 1000 * gravity);
+    wstar = v * 1000 / armlen;
+    phase = 0;
+
+    while (1) {
+        // ---- yaw: PD to the bearing ----
+        int yaw  = read(S_YAW);
+        int yawv = read(S_YAW_VEL);
+        write(A_TQ_YAW, ((yawTarget - yaw) * 200 - yawv * 40) / 1000);
+
+        // ---- elbow whip: cock to ELBOW_COCK in phase 0, else straighten ----
+        int et = 0;
+        if (phase == 0) et = ELBOW_COCK;
+        int el  = read(S_ELBOW);
+        int elv = read(S_ELBOW_VEL);
+        write(A_TQ_ELBOW, ((et - el) * 220 - elv * 40) / 1000);
+
+        // ---- shoulder: wind back, swing, release ----
+        int sh  = read(S_SHOULDER);
+        int shv = read(S_SHOULDER_VEL);
+        int st;
+        if (phase == 0) {
+            st = ((WINDBACK - sh) * 260 - shv * 50) / 1000;
+            // advance only when wound back AND the shoulder has settled
+            if (sh <= WINDBACK + 120 && shv <= 250 && shv >= -250) phase = 1;
+        } else if (phase == 1) {
+            st = (wstar - shv) * 120 / 1000;
+            if (sh >= RELEASE_ANGLE && shv > 0) {
+                write(A_RELEASE, 1);
+                phase = 2;
+            }
+        } else {
+            // follow-through: ease the shoulder back toward a ready pose
+            st = ((0 - sh) * 200 - shv * 40) / 1000;
+        }
+        write(A_TQ_SHOULDER, st);
+        yield();
+    }
+}

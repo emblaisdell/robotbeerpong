@@ -42,60 +42,70 @@ the animation.
 
 ## What's here / design decisions
 
-**No QEMU — a real RV32IM interpreter in the browser instead.** QEMU is a
+**No QEMU - a real RV32IM interpreter in the browser instead.** QEMU is a
 full-system emulator and can't run natively in a tab; but the part the game
-actually needs is small — a CPU that executes the players' machine code and
+actually needs is small - a CPU that executes the players' machine code and
 talks to the robot through memory-mapped registers. So `src/riscv.js` is a
 faithful RV32I + M (multiply/divide) core plus a small assembler. Each player's
-*real machine code* is executed instruction-by-instruction every turn. (A
-future QEMU-fidelity path would be a WASM RISC-V core running gcc-built ELFs —
-not needed to play.)
+*real machine code* is executed instruction-by-instruction, looping every
+control tick (`ecall` yields to the next tick). (A future QEMU-fidelity path
+would be a WASM RISC-V core running gcc-built ELFs - not needed to play.)
 
-**The robot is bare-metal.** Players are integer-only RV32IM assembly. They poke
-hardware registers (memory-mapped IO) for sensors and actuators — exactly how a
-real bare-metal robot would:
+**The robot is bare-metal - and the program is a real-time controller.** Players
+don't issue a high-level "throw" command. They run a control loop: every tick
+(240 Hz) the program reads the live joint sensors (angles + angular velocities)
+and writes a **motor torque** to each joint (`src/arm.js` integrates the arm
+dynamics - inertia, gravity, damping, limits). `ecall` yields one tick; registers
+persist across ticks, so the program *is* the loop. When it writes `A_RELEASE`,
+the ball leaves at the arm's **true end-effector velocity** - the swing is the
+throw, computed by forward kinematics from the joint motion. The arm keeps
+simulating afterward (follow-through) and is continuous across turns.
 
-| Sensors (read) | | Actuators (write) | |
+| Sensors (read each tick) | | Actuators (write) | |
 |---|---|---|---|
-| `S_BEARING` | mrad to nearest live cup | `A_YAW` | commanded waist yaw |
-| `S_RANGE` | mm to that cup | `A_PITCH` | arm elevation |
-| `S_GRAVITY` | mm/s² (for ballistics) | `A_POWER` | launch speed (mm/s) |
-| `S_DRINKS`, `S_RNG`, `S_CUPS`, … | | `A_FIRE` | store 1 → throw |
+| `S_SHOULDER` / `S_SHOULDER_VEL` | joint angle + rate | `A_TQ_SHOULDER` | shoulder motor torque |
+| `S_ELBOW` / `S_ELBOW_VEL`, `S_YAW`/… | the other joints | `A_TQ_ELBOW`, `A_TQ_YAW` | elbow / waist torque |
+| `S_BEARING`, `S_RANGE`, `S_GRAVITY`, `S_ARMLEN` | for inverse kinematics | `A_RELEASE` | let go of the ball |
 
 The ABI lives in `src/constants.js` (single source of truth for both the asm and
 the sim), and is documented for player authors in
 [docs/robot-isa.md](docs/robot-isa.md).
 
 **Inebriation.** You score by sinking your *opponent's* cups, which makes the
-*opponent* drink — so the loser snowballs. Drinks (in `src/engine.js`) corrupt
-sensor reads (noise), actuation (over/under-actuation + aim bias), and program
-memory (random byte flips that can make the program crash and *fumble* the
-ball). Tuned so total failure is rare and the misfires are comedic.
+*opponent* drink - so the loser snowballs. Drinks (in `src/engine.js`) corrupt
+sensor reads (noise on every joint reading), actuation (torque scale + bias +
+*lag*), and program memory (byte flips that can crash the controller mid-swing).
+Tuned so total failure is rare and the misfires are comedic.
 
 ## The candidate players (`src/players.js`)
 
-- **Sniper** — honest ballistics: aims at the true bearing and solves for launch
-  speed with an integer `isqrt`. Deadly sober; its precision is what the noise
-  wrecks.
-- **Lobber** — a cheap linear power model (no sqrt). Sturdy and pragmatic.
-- **YOLO** — fixed power, random jitter, basically ignores its sensors. The
-  control group; gloriously chaotic once drunk.
+All three share a PD swing controller (wind back → drive shoulder angular
+velocity → release at the launch angle, with an elbow whip). They differ in how
+they pick the target speed:
 
-Both Sniper and Lobber clear a 6-cup rack in 6 throws when sober (verified).
+- **Sniper** - honest inverse ballistics: `isqrt(g·range·k)` → target tip speed →
+  shoulder angular velocity via the Jacobian. Precise; the sensor/torque noise
+  wrecks its release timing.
+- **Lobber** - a cheap linear tip-speed model (no sqrt). Sturdy and pragmatic.
+- **YOLO** - fixed swing speed, random aim. The control group; chaotic once drunk.
+
+Sniper and Lobber clear a 6-cup rack in 6 throws when sober (verified), and
+Sniper's precision beats Lobber head-to-head.
 
 ## Layout
 
 ```
 index.html            UI shell + Three.js import map
 src/constants.js      MMIO ABI, court layout, fixed-point units
-src/riscv.js          RV32IM interpreter + assembler
-src/players.js        the candidate RISC-V strategies (assembly)
-src/physics.js        pure ballistics + court geometry
+src/riscv.js          RV32IM interpreter + assembler (ecall = yield a tick)
+src/players.js        the candidate RISC-V joint controllers (assembly)
+src/arm.js            torque-driven 3-joint arm dynamics + forward kinematics
+src/physics.js        court geometry + bearing/range helpers
 src/cupworld.js       rigid-body world (cannon-es): cup colliders + ball
-src/engine.js         headless match engine + inebriation penalties
-src/view.js           Three.js scene, model loading, animation
+src/engine.js         per-tick control loop + arm dynamics + ball physics + scoring
+src/view.js           Three.js scene; replays the recorded joint/ball timeline
 src/main.js           UI wiring + render loop
-tools/                node test + calibration harnesses (no browser needed)
+tools/                node test + tuning harnesses (no browser needed)
 ```
 
 The browser needs no install (Three.js and cannon-es load from a CDN). The
@@ -103,7 +113,8 @@ headless Node checks need the physics engine locally, so run `npm install` once,
 then:
 
 ```sh
-node tools/test-riscv.mjs    # CPU + assembler unit tests
-node tools/test-engine.mjs   # full matches (rigid-body physics), accuracy, termination
-node tools/test-physics.mjs  # cup collisions + re-derive the ballistics constant
+node tools/test-riscv.mjs        # CPU + assembler unit tests
+node tools/test-arm.mjs          # arm kinematics + dynamics
+node tools/proto-controller.mjs  # prototype/tune a control law (matches the asm)
+node tools/test-engine.mjs       # full matches: control loop + real physics
 ```

@@ -1,239 +1,198 @@
-# Robot Beer Pong — Robot ISA & Programming Guide
+# Robot Beer Pong - Robot ISA & Programming Guide
 
 This is the contract between a **player program** (RISC-V machine code) and the
-**robot** it drives. If you want to write a new strategy, this is the reference.
+**robot** it drives. The robot is a bare-metal RV32IM machine - no OS, no
+syscalls, no floating point - and it is a **real-time joint controller**: your
+program runs every tick, reads the live joint sensors, and commands a motor
+torque to each joint. The ball is thrown by the arm's actual motion, not by a
+high-level "throw" command.
 
-The robot is a bare-metal RV32IM machine. It has no operating system, no
-syscalls, no floating point. It talks to its sensors and actuators through
-**memory-mapped IO** (MMIO): you read and write ordinary memory addresses, and
-some of those addresses are wired to hardware instead of RAM.
-
-> **Source of truth:** every address and constant below is defined once in
-> [`src/constants.js`](../src/constants.js) and imported by both the assembler
-> (as symbol names) and the simulation bridge ([`src/engine.js`](../src/engine.js)),
-> so they cannot drift. The reference players live in
-> [`src/players.js`](../src/players.js).
+> **Source of truth:** every address/constant is defined once in
+> [`src/constants.js`](../src/constants.js) (imported by both the asm and the
+> sim) and the arm model in [`src/arm.js`](../src/arm.js). Reference controllers
+> live in [`src/players.js`](../src/players.js).
 
 ---
 
-## 1. Mental model: one throw per turn
+## 1. Mental model: a control loop, not a command
 
-A match alternates turns. On your turn the robot:
-
-1. **Resets.** Registers are zeroed, `pc = 0x0000`, `sp = 0x0F000`. A *fresh*
-   copy of your program is loaded into memory (see [§8](#8-statelessness) — you
-   do **not** keep state between turns).
-2. **Runs your code** from address `0x0000` until you execute `ecall`, or until
-   the instruction budget (200,000) is exhausted.
-3. **Throws.** Whatever you last wrote to the actuator registers is used to
-   launch the ball — *if* you wrote `1` to `A_FIRE`. If you never fired, the arm
-   fumbles the ball (a wild, weak toss).
-
-Your job each turn: read the sensors, compute a throw, write the actuators,
-fire, halt. That's it.
+Your program is **one long loop**. `ecall` does not end anything - it **yields
+one tick** (~1/240 s of simulated time) and then your program resumes right
+after it, with its registers and memory intact. So the shape is always:
 
 ```asm
 start:
-    # ... read sensors, compute yaw/pitch/power ...
-    sw  s_yaw,   0(reg_A_YAW)     # aim
-    sw  s_pitch, 0(reg_A_PITCH)   # elevation
-    sw  s_power, 0(reg_A_POWER)   # speed
-    li  t1, 1
-    sw  t1, 0(reg_A_FIRE)         # release the magnet -> throw
-    ecall                         # end the turn
+    # one-time setup (read range, compute targets) ...
+loop:
+    # read joint sensors, compute torques, write them ...
+    ecall          # yield: the world advances one tick, sensors refresh
+    j    loop
 ```
 
----
+Each tick the engine: refreshes the sensor registers from the live arm, runs
+your program until it `ecall`s (or hits the 6000-instruction budget), reads the
+torques you wrote, and integrates the arm dynamics one step. When you write
+`A_RELEASE`, the magnet lets go and the ball launches at the **end-effector's
+true velocity**. The arm keeps simulating afterward (follow-through), and it is
+**not reset between turns** - next turn it picks up from wherever it came to
+rest.
 
-## 2. Memory map
-
-| Region        | Range                   | Notes                                  |
-|---------------|-------------------------|----------------------------------------|
-| Program / text| `0x00000` …             | Your code is loaded here; `pc` starts at `0`. |
-| Data / heap   | … up to the stack       | Use `.word` / `.byte`, or scratch RAM. |
-| Stack         | grows down from `0x0F000` | `sp` is initialised to `0x0F000`.    |
-| **MMIO**      | `0x10000` … `0x10FFF`   | Sensor/actuator registers (below).     |
-| Total RAM     | `0x20000` (128 KiB)     |                                        |
-
-All accesses are little-endian. Loads/stores inside the MMIO window are routed
-to the device, not RAM. Use word (`lw`/`sw`) access for registers.
+You have up to ~900 ticks (~3.75 s) to wind up and release, or the turn fizzles.
 
 ---
 
-## 3. Sensor registers (read-only)
+## 2. The arm
 
-Read with `lw`. Values are integers in the fixed-point units of [§5](#5-units).
+Three revolute joints, each a torque-driven motor with inertia, viscous
+damping, gravity, and hard angle limits:
 
-| Name        | Address   | Unit      | Meaning |
-|-------------|-----------|-----------|---------|
-| `S_BEARING` | `0x10000` | mrad, signed | Horizontal angle to the **nearest live opponent cup**. `0` = straight ahead; positive = one way, negative = the other. |
-| `S_RANGE`   | `0x10004` | mm        | Ground distance to that cup. |
-| `S_DRINKS`  | `0x10008` | count     | How inebriated you are (= how many of *your* cups have been sunk). Drives every handicap in [§7](#7-the-inebriation-handicap). |
-| `S_YAW`     | `0x1000C` | mrad      | Current waist (yaw) joint angle. At rest this is ~0 (plus sensor error). |
-| `S_PITCH`   | `0x10010` | mrad      | Current arm (pitch) joint angle. |
-| `S_GRAVITY` | `0x10014` | mm/s²     | Gravity, so you can do honest ballistics. Currently `2600`. |
-| `S_RNG`     | `0x10018` | u32       | A fresh pseudo-random word each read. |
-| `S_CUPS`    | `0x1001C` | count     | Opponent cups still standing (your targets remaining). |
+| Joint | Sensor angle (0 =) | + direction | limit | torque ceiling |
+|-------|--------------------|-------------|-------|----------------|
+| yaw (waist)     | aimed straight at opponent | turns one way   | ±1.2 rad | ±60 |
+| shoulder (arm)  | straight up                | tips toward cups | ±2.5 rad | ±220 |
+| elbow (hand)    | inline with upper arm      | continues the bend | ±2.6 rad | ±90 |
 
-Sensor reads are **noisy when you're drunk** — see [§7](#7-the-inebriation-handicap).
-Read each register once into a register and reuse it; re-reading `S_BEARING`
-gives a *different* noisy sample each time.
+The two segments are equal length; shoulder→tip reach is reported in `S_ARMLEN`
+(1280 mm). The motor torque you write is clamped to the ceiling above; the joint
+then obeys `ω += (τ − damping·ω − gravity(θ))·dt`, `θ += ω·dt`. You must actively
+drive the joints - gravity will pull the arm down if you don't.
 
 ---
 
-## 4. Actuator registers (write-only)
+## 3. Sensor registers (read-only, refreshed each tick)
 
-Write with `sw`. The throw uses the **last** value written to each before you halt.
+Read with `lw`. Integers in the fixed-point units of [§5](#5-units). Reads are
+**noisy when you're drunk** (see [§7](#7-the-inebriation-handicap)).
 
-| Name      | Address   | Unit  | Meaning |
-|-----------|-----------|-------|---------|
-| `A_YAW`   | `0x10020` | mrad  | Commanded waist yaw. `0` aims straight ahead; set it to `S_BEARING` to aim at the nearest cup. |
-| `A_PITCH` | `0x10024` | mrad  | Launch elevation. `785` ≈ 45°, the range-maximising angle. |
-| `A_POWER` | `0x10028` | mm/s  | Launch speed. This is what ballistics is about. |
-| `A_FIRE`  | `0x1002C` | flag  | Write `1` to commit the throw. **No fire → the ball is fumbled.** |
-| `A_LOG`   | `0x10030` | i32   | Debug: each value written appears in the match's play-by-play log. |
+| Name | Address | Unit | Meaning |
+|------|---------|------|---------|
+| `S_TICK`        | `0x10000` | count | ticks since the turn began |
+| `S_BEARING`     | `0x10004` | mrad  | horizontal angle to the nearest live cup |
+| `S_RANGE`       | `0x10008` | mm    | ground distance to that cup |
+| `S_GRAVITY`     | `0x1000C` | mm/s² | gravity (currently 2600) |
+| `S_YAW`         | `0x10010` | mrad  | waist angle |
+| `S_YAW_VEL`     | `0x10014` | mrad/s | waist angular velocity |
+| `S_SHOULDER`    | `0x10018` | mrad  | shoulder angle (0 = straight up) |
+| `S_SHOULDER_VEL`| `0x1001C` | mrad/s | shoulder angular velocity |
+| `S_ELBOW`       | `0x10020` | mrad  | elbow angle |
+| `S_ELBOW_VEL`   | `0x10024` | mrad/s | elbow angular velocity |
+| `S_DRINKS`      | `0x10028` | count | inebriation level (own cups lost) |
+| `S_CUPS`        | `0x1002C` | count | opponent cups still standing |
+| `S_RNG`         | `0x10030` | u32   | fresh pseudo-random word |
+| `S_ARMLEN`      | `0x10034` | mm    | shoulder→tip reach (for IK) |
+| `S_HELD`        | `0x10038` | 0/1   | 1 while the magnet still holds the ball |
+
+## 4. Actuator registers (write, latched each tick)
+
+| Name | Address | Meaning |
+|------|---------|---------|
+| `A_TQ_YAW`      | `0x10040` | yaw motor torque (clamped to ±60) |
+| `A_TQ_SHOULDER` | `0x10044` | shoulder motor torque (±220) |
+| `A_TQ_ELBOW`    | `0x10048` | elbow motor torque (±90) |
+| `A_RELEASE`     | `0x1004C` | write 1 → the magnet lets go of the ball |
+| `A_LOG`         | `0x10050` | write a value → debug log |
 
 ---
 
 ## 5. Units & fixed-point
 
-RV32I has no FPU, so everything is integers:
+Integer-only (no FPU): angles in **milliradians** (1 rad = 1000), angular
+velocity in **mrad/s**, lengths in **mm** (1 world unit = 100 mm), gravity in
+**mm/s²**. Torque is a unitless integer clamped to the ceilings above. Watch for
+32-bit overflow - order your multiplies and divide early.
 
-- **Angles** — milliradians (`1 rad = 1000`; `π ≈ 3142`; `45° ≈ 785`).
-- **Lengths** — millimetres (`1 world unit = 100 mm`).
-- **Speeds** — mm per second.
+### Inverse kinematics hint
 
-Because there's no float and no overflow checking, watch your intermediate
-magnitudes (a 32-bit signed int maxes at ~2.1 billion). Order your multiplies to
-keep products small — e.g. divide before the final multiply.
-
-### Ballistics hint
-
-The launch turns `(yaw, pitch, power)` into a velocity and the ball flies under
-`S_GRAVITY`. For a shot at 45°, range and speed relate (very nearly) by
-
-```
-power ≈ isqrt( gravity × range )        # then trimmed for launch height
-```
-
-The reference **Sniper** uses `power = isqrt(gravity × range × 785 / 1000)`,
-where the `0.785` folds in the launch-height correction calibrated against the
-rigid-body simulation by [`tools/test-physics.mjs`](../tools/test-physics.mjs).
-Integer `isqrt` is a dozen instructions (see Sniper's `scan:`/`body:` loop). The
-**Lobber** skips the sqrt with a linear fit `power = range × 329 / 1000 + 1549`.
-
-The shot is resolved by a real rigid-body simulation: the ball is a sphere that
-collides with cup-shaped colliders, bounces off rims, and a cup is *made* only
-when the ball comes to rest inside it. So "land it at the cup" really means
-"drop it through the mouth" — a hair short and you clank off the rim.
+The throw is the tip velocity at release. For a straight arm rotating at the
+shoulder, the tip speed is `v = ω · L` (L = `S_ARMLEN`), and the velocity points
+perpendicular to the arm - so releasing while the shoulder leans **back** at
+angle θ launches the ball up-forward at elevation θ. The reference controllers
+therefore: pick a target tip speed `v` from the range (`v = isqrt(g·range·k)`),
+convert it to a target shoulder angular velocity `wstar = v·1000 / S_ARMLEN`,
+wind the shoulder back, drive its angular velocity to `wstar`, and release as it
+swings up through a fixed lean-back angle (~−785 mrad → ~45° launch). The elbow
+is whipped (cocked back, snapped straight) but is ~straight at release so it
+doesn't change the speed.
 
 ---
 
 ## 6. Instruction set & assembler
 
-The CPU implements **RV32I + RV32M** (base integers plus `mul`/`mulh*`/`div[u]`/
-`rem[u]`). `ecall` and `ebreak` **halt the turn**; the value in `a0` is reported
-as the halt code but is otherwise unused.
-
-The in-browser assembler ([`src/riscv.js`](../src/riscv.js)) accepts:
-
-- **All RV32I/M instructions**, ABI register names (`a0`–`a7`, `t0`–`t6`,
-  `s0`–`s11`, `sp`, `ra`, `zero`, …) and `x0`–`x31`.
-- **Pseudo-instructions:** `li`, `la`, `mv`, `nop`, `not`, `neg`, `seqz`,
-  `snez`, `j`, `jr`, `ret`, `call`, `beqz`, `bnez`, `bltz`, `bgez`, `bgtz`,
-  `blez`, `bgt`, `ble`, `bgtu`, `bleu`.
-- **Directives:** `.word`, `.byte`, `.equ` / `.set`, `.align`,
-  `.text`/`.data`/`.globl` (accepted, single flat segment). Labels are `name:`.
-- **Comments:** `#` or `;` to end of line.
-
-Memory operands use the usual `offset(reg)` form; bare symbols assemble to an
-absolute address via `x0`. Entry is the `start:` (or `_start:`) label, else `0`.
-
-The MMIO names (`S_BEARING`, `A_FIRE`, …) are injected as assembler constants, so
-you can write `li t0, A_FIRE` directly.
+RV32I + RV32M (`mul`/`div`/`rem`). `ecall` = yield one tick; `ebreak` /
+illegal instruction = crash (the arm goes limp and the turn fizzles). The
+in-browser assembler ([`src/riscv.js`](../src/riscv.js)) supports ABI register
+names, the usual pseudo-instructions (`li`, `mv`, `j`, `call`, `ret`, `beqz`,
+`bgt`, `bgtu`, `neg`, …), `offset(reg)` memory operands, and the `.word`,
+`.byte`, `.equ`, `.align` directives. The MMIO names above are injected as
+assembler constants. Execution starts at the `start:` label.
 
 ---
 
 ## 7. The inebriation handicap
 
-You score by sinking your **opponent's** cups, which makes *them* drink. So the
-robot that's losing gets drunk — and a drunk robot plays worse. Everything below
-scales with `drinks` (= `S_DRINKS`); at `drinks = 0` none of it applies.
+You score by sinking your **opponent's** cups, which makes *them* drink - so the
+loser gets drunk and plays worse. Everything below scales with `S_DRINKS`; at 0
+none applies.
 
-All noise is roughly Gaussian with the listed standard deviation.
+| What degrades | How, per drink |
+|---------------|----------------|
+| sensor reads (angles, velocities) | ± noise on every read |
+| `S_BEARING` / `S_RANGE`           | ± noise (aim/range drift) |
+| actuated torque                   | scale error + bias + **lag** (commands arrive late) |
+| program memory                    | random byte-flips - can crash the controller mid-swing |
 
-| What degrades        | How, per drink |
-|----------------------|----------------|
-| `S_BEARING` reads    | ± `18 × drinks` mrad of noise, fresh each read. |
-| `S_RANGE` reads      | ± `90 × drinks` mm of noise. |
-| `S_YAW` / `S_PITCH`  | ± `8 × drinks` mrad of noise. |
-| Actuated yaw         | over/under-actuation `×(1 ± 0.02·drinks)` **plus** a `± 20·drinks` mrad aim bias. |
-| Actuated pitch       | `± 14 × drinks` mrad bias. |
-| Actuated power       | over/under-actuation `×(1 ± 0.05·drinks)`. |
-| Program memory       | up to `drinks` random byte-flips in `[0x0000, 0x4000)` each turn — can corrupt code/data and make you crash or fumble. |
-
-The magnitudes are tuned so total failure stays *avoidable* and the misfires are
-comedic, not fatal. A precise strategy (Sniper) is hurt most by the read/aim
-noise; a robust one (Lobber) rides it out longer.
+A precise controller is hit hardest by the sensor/torque noise wrecking its
+release timing; a sturdier one rides it out longer. The handicap is tuned so
+total failure is rare and the misfires are comedic.
 
 ---
 
-## 8. Statelessness
+## 8. A minimal controller
 
-Every turn starts from a **fresh program image and zeroed registers**. Anything
-you wrote to RAM last turn is gone; there are no persistent globals. If you want
-"memory" across turns, you have to derive it from the sensors (e.g. `S_CUPS`,
-`S_DRINKS`) — there is intentionally no hidden channel.
-
-The instruction budget is **200,000 per turn**. Run past it without firing and
-the turn ends in a fumble, so avoid unbounded loops.
-
----
-
-## 9. A minimal player
-
-Aim at the nearest cup, lob it at a fixed power, fire, done:
+Wind the shoulder back, swing it forward at full torque, release as it passes
+the launch angle - aimed straight ahead, fixed power. (The reference `SNIPER`
+adds inverse ballistics, yaw aiming, an elbow whip, and a follow-through.)
 
 ```asm
-# minimal.s — aim at the nearest cup, throw at a fixed speed.
 start:
-    li   t0, S_BEARING
-    lw   a0, 0(t0)          # a0 = bearing to nearest live cup (mrad)
+    li   s0, 0                 # phase: 0 = wind back, 1 = swing
+loop:
+    li   t0, S_SHOULDER
+    lw   a1, 0(t0)             # shoulder angle
+    bnez s0, swing
 
-    li   t0, A_YAW
-    sw   a0, 0(t0)          # aim there
-
-    li   t0, A_PITCH
-    li   t1, 785            # ~45 degrees
-    sw   t1, 0(t0)
-
-    li   t0, A_POWER
-    li   t1, 3000           # mm/s — a mid-rack lob
-    sw   t1, 0(t0)
-
-    li   t0, A_FIRE
-    li   t1, 1
-    sw   t1, 0(t0)          # release the magnet
-    ecall                   # end the turn
+    # wind back toward -1450 mrad
+    li   t3, -200             # constant back-torque
+    li   t4, -1330
+    bgt  t4, a1, swing_set    # reached? (-1330 > sh) -> switch
+    j    write
+swing_set:
+    li   s0, 1
+swing:
+    li   t3, 220              # full forward torque
+    li   t4, -785
+    blt  a1, t4, write        # not up to release angle yet
+    li   t0, A_RELEASE
+    li   t5, 1
+    sw   t5, 0(t0)            # let go
+write:
+    li   t0, A_TQ_SHOULDER
+    sw   t3, 0(t0)
+    ecall                     # yield one tick
+    j    loop
 ```
-
-For a version that actually *solves* for the right power from `S_RANGE` and
-`S_GRAVITY`, read `SNIPER` in [`src/players.js`](../src/players.js).
 
 ---
 
-## 10. Adding & testing a strategy
+## 9. Adding & testing a strategy
 
-1. Add an entry to `PLAYERS` in [`src/players.js`](../src/players.js) with your
-   assembly `source` (use the `MMIO_EQU` names — they're already in scope for the
-   assembler).
-2. It shows up automatically in the strategy dropdowns in the browser.
-3. Headless checks (no browser needed):
-   - `node tools/test-engine.mjs` — sober accuracy, head-to-head, termination.
-   - `node tools/calibrate.mjs` — re-derive ballistics constants if you change
-     court/gravity/launch-height.
-   - `node tools/test-riscv.mjs` — CPU + assembler unit tests.
+1. Add an entry to `PLAYERS` in [`src/players.js`](../src/players.js) (use the
+   `MMIO_EQU` names).
+2. Headless checks (`npm install` once for the physics engine):
+   - `node tools/test-riscv.mjs` - CPU + assembler unit tests
+   - `node tools/test-arm.mjs` - arm kinematics/dynamics
+   - `node tools/proto-controller.mjs` - prototype/tune a control law in JS
+   - `node tools/test-engine.mjs` - full matches (control loop + real physics)
 
-A "good when sober" strategy should clear a 6-cup rack in ~6 throws with
-`drinks` forced to 0; the inebriation handicap is what separates the contenders.
-```
+The reference controllers were prototyped in `proto-controller.mjs` (matching
+the asm's integer arithmetic exactly) and transcribed to assembly.

@@ -7,9 +7,8 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { COURT, MRAD, BALL_RADIUS, LAUNCH_HEIGHT, PHYS } from './constants.js';
+import { COURT, BALL_RADIUS, CTRL } from './constants.js';
 import { rackPositions } from './physics.js';
-import { CupWorld } from './cupworld.js';
 
 const MODELS = {
   robot: 'web-models/robot.glb',
@@ -159,34 +158,13 @@ export class GameView {
     // opponent down the court (A at -Z looks toward +Z, B at +Z toward -Z).
     group.rotation.y = side < 0 ? -Math.PI / 2 : Math.PI / 2;
 
-    // Find articulated nodes for cosmetic aiming/swing. With the body turned,
-    // the shoulder now swings about the arm's local Z to throw down the court.
+    // Articulated joints, driven each frame from the engine's recorded angles:
+    // waist = yaw, arm = shoulder pitch, hand = elbow pitch.
     const waist = model.getObjectByName('Waist');
     const arm = model.getObjectByName('Arm');
     const hand = model.getObjectByName('Hand');
-    const magnet = model.getObjectByName('Magnet');
-    const robot = {
-      group, model, side, waist, arm, hand, magnet, baseYaw: 0,
-      baseArmZ: arm ? arm.rotation.z : 0,
-      baseHandZ: hand ? hand.rotation.z : 0,
-      // B is A turned 180°, so the same swing sign carries both hands toward
-      // their own opponent's cups.
-      swingSign: -1,
-    };
+    const robot = { group, model, side, waist, arm, hand };
     this.scene.add(group);
-    // Measure where the magnet tip rests so the held ball sits a fixed amount
-    // *beyond* it and the ball's rest height equals the physics LAUNCH_HEIGHT
-    // (making release seamless).
-    group.updateMatrixWorld(true);
-    if (magnet) {
-      const p = new THREE.Vector3();
-      magnet.getWorldPosition(p);
-      robot.magnetRestY = p.y;
-      robot.ballBeyond = LAUNCH_HEIGHT - p.y; // local +Y offset along the arm tip
-    } else {
-      robot.magnetRestY = LAUNCH_HEIGHT;
-      robot.ballBeyond = 0;
-    }
     return robot;
   }
 
@@ -253,27 +231,16 @@ export class GameView {
     }
   }
 
-  // Animate one throw. `liveCups` are the opponent's standing cups
-  // [{index,x,z}]; `done(outcome)` fires when the ball has settled, with the
-  // physics result { result:'sink'|'miss', cupIndex }.
-  playThrow(event, liveCups, done, speed = 1) {
+  // Replay one simulated turn. `turn` is the engine's record: armFrames (joint
+  // angles + held-ball tip over the control loop) and ballFrames (ball + cup
+  // bodies during flight). `done(outcome)` fires when it's all settled.
+  playThrow(turn, done, speed = 1) {
     this.speed = speed;
     this.onTurnDone = done;
-    const robot = event.thrower === 'A' ? this.robots.A : this.robots.B;
-    const yaw = (event.command?.yawMrad || 0) / MRAD;
-
-    // Reset knocked cups, then build the rigid-body world for this throw.
+    const robot = turn.thrower === 'A' ? this.robots.A : this.robots.B;
     this._resetCups();
-    this.world = new CupWorld({ cups: liveCups });
-    this.oppSide = String(event.oppSide);
+    this.oppSide = String(turn.oppSide);
 
-    this.anim = {
-      event, robot, phase: 'windup', t: 0,
-      windup: 0.32, throwT: 0.16, settle: 0.7,
-      yaw, released: false, physAccum: 0, outcome: null,
-      prevMagQuat: null, spinAxis: null, spinRate: 0, // ball spin from the arm
-    };
-    // make the ball, then have the magnet hold it just beyond the arm tip
     if (!this.ball) {
       this.ball = this.proto.ball.clone(true);
       this.ball.scale.setScalar((BALL_RADIUS * 2) / this.nativeSize.ball.y);
@@ -289,80 +256,22 @@ export class GameView {
       });
       this.scene.add(this.ball);
     }
-    this.ball.rotation.set(0, 0, 0);   // fresh orientation each throw
-    this.ball.visible = true;
-    this._holdBall(robot);
+    this.ball.rotation.set(0, 0, 0);
+    // If the program never fired, don't replay seconds of flailing — show ~1s.
+    const armLen = turn.fired ? turn.armFrames.length : Math.min(turn.armFrames.length, 240);
+    this.anim = {
+      turn, robot, armLen,
+      phase: turn.armFrames.length ? 'play' : 'end',
+      i: 0, settleT: 0, popped: false,
+    };
+    if (turn.armFrames.length) { this.ball.visible = true; this._applyJoints(robot, turn.armFrames[0]); }
   }
 
-  // Measure the magnet's angular velocity (world frame) from its rotation over
-  // one frame — the spin the ball will inherit when the magnet lets go.
-  _trackSpin(r, a, dt) {
-    if (!r.magnet) return;
-    const cur = new THREE.Quaternion();
-    r.magnet.getWorldQuaternion(cur);
-    if (a.prevMagQuat && dt > 1e-5) {
-      const dq = cur.clone().multiply(a.prevMagQuat.clone().invert()).normalize();
-      const w = Math.min(1, Math.max(-1, dq.w));
-      const angle = 2 * Math.acos(Math.abs(w));
-      const s = Math.sqrt(Math.max(0, 1 - w * w));
-      if (s > 1e-4 && angle > 1e-5) {
-        const sign = w < 0 ? -1 : 1;
-        a.spinAxis = new THREE.Vector3(dq.x / s, dq.y / s, dq.z / s).multiplyScalar(sign).normalize();
-        a.spinRate = Math.min(45, angle / dt); // clamp to a sane visual max
-      }
-    }
-    a.prevMagQuat = cur.clone();
-  }
-
-  // Place the ball just beyond the magnet, tracking the arm as it swings.
-  _holdBall(r) {
-    if (!r.magnet) return;
-    const p = new THREE.Vector3();
-    const q = new THREE.Quaternion();
-    r.magnet.getWorldPosition(p);
-    r.magnet.getWorldQuaternion(q);
-    const off = new THREE.Vector3(0, r.ballBeyond, 0).applyQuaternion(q);
-    this.ball.position.copy(p).add(off);
-  }
-
-  // The magnet lets go: hand the ball (with its spin) to the physics world.
-  // Its held rest position equals event.origin, so the hand-off is seamless.
-  _releasePhysics() {
-    const a = this.anim;
-    a.released = true;
-    a.phase = 'physics';
-    a.physAccum = 0;
-    this.ball.visible = true;
-    const spin = a.spinAxis
-      ? { axis: { x: a.spinAxis.x, y: a.spinAxis.y, z: a.spinAxis.z }, rate: a.spinRate }
-      : null;
-    this.world.launch({ origin: a.event.origin, velocity: a.event.velocity, spin });
-  }
-
-  // Ball has come to rest: record the outcome, pop the made cup.
-  _finishPhysics() {
-    const a = this.anim;
-    a.outcome = this.world.outcome || { result: 'miss', cupIndex: -1 };
-    if (a.outcome.result === 'sink' && a.outcome.cupIndex >= 0) {
-      const g = this.cupMeshes[this.oppSide][a.outcome.cupIndex];
-      if (g) g.userData.dying = true;   // pull the made cup
-      this.ball.visible = false;
-    }
-    a.phase = 'settle';
-    a.t = 0;
-  }
-
-  // Sync the Three.js meshes to the physics bodies.
-  _syncPhysics() {
-    const bs = this.world.ballState();
-    if (bs) { this.ball.position.set(bs.x, bs.y, bs.z); this.ball.quaternion.set(bs.qx, bs.qy, bs.qz, bs.qw); }
-    for (const cs of this.world.cupStates()) {
-      const g = this.cupMeshes[this.oppSide][cs.index];
-      if (g && !g.userData.dying) {
-        g.position.set(cs.x, cs.y, cs.z);
-        g.quaternion.set(cs.qx, cs.qy, cs.qz, cs.qw);
-      }
-    }
+  // Drive the GLB joints from a recorded arm frame.
+  _applyJoints(r, f) {
+    if (r.waist) r.waist.rotation.y = f.yaw * (r.side < 0 ? 1 : -1);
+    if (r.arm) r.arm.rotation.z = -f.shoulder;
+    if (r.hand) r.hand.rotation.z = -f.elbow;
   }
 
   update() {
@@ -372,52 +281,65 @@ export class GameView {
 
     const a = this.anim;
     if (a) {
-      a.t += dt;
       const r = a.robot;
-      // Swing angles s: 0 rest, <0 wound back, >0 thrown forward (toward cups).
-      // The shoulder (arm) leads; the elbow (hand) lags then snaps for a whip.
-      const setSwing = (s) => { if (r.arm) r.arm.rotation.z = r.baseArmZ + r.swingSign * s; };
-      const setElbow = (s) => { if (r.hand) r.hand.rotation.z = r.baseHandZ + r.swingSign * s; };
-      const restArmZ = r.baseArmZ, restHandZ = r.baseHandZ;
-      if (a.phase === 'windup') {
-        const k = Math.min(1, a.t / a.windup);
-        if (r.waist) r.waist.rotation.y = a.yaw * (r.side < 0 ? 1 : -1) * k;
-        setSwing(-0.9 * k);                                    // shoulder winds back
-        setElbow(-0.6 * k);                                    // elbow cocks back
-        this._holdBall(r); this._trackSpin(r, a, dt);         // magnet still holds it
-        if (a.t >= a.windup) { a.phase = 'throw'; a.t = 0; }
-      } else if (a.phase === 'throw') {
-        const k = Math.min(1, a.t / a.throwT);
-        setSwing(-0.9 + 1.5 * k);                              // shoulder swings forward
-        setElbow(-0.6 + 1.7 * (k * k));                        // elbow snaps late (whip)
-        if (!a.released) { this._holdBall(r); this._trackSpin(r, a, dt); } // carried + spun up
-        if (k >= 0.6 && !a.released) this._releasePhysics();
-        if (a.t >= a.throwT && !a.released) this._releasePhysics();
-      } else if (a.phase === 'physics') {
-        // Step the rigid-body world at a fixed rate (scaled by playback speed),
-        // syncing the ball + cup meshes to the bodies. Physics decides the rest.
-        a.physAccum += dt;
-        let guard = 0;
-        while (a.physAccum >= PHYS.fixedDt && !this.world.done && guard < 16) {
-          this.world.step();
-          a.physAccum -= PHYS.fixedDt;
-          guard++;
+      const turn = a.turn;
+      if (a.phase === 'play') {
+        // One timeline at the control-tick rate. The arm keeps moving the whole
+        // time (wind-up, swing, release, follow-through). The ball is held at the
+        // tip until releaseIndex, then follows its own rigid-body timeline while
+        // the arm follows through.
+        a.i += dt / CTRL.dt;
+        const idx = Math.min(a.armLen - 1, Math.floor(a.i));
+        this._applyJoints(r, turn.armFrames[idx]);
+        const rel = turn.releaseIndex;
+        if (rel < 0 || idx < rel) {
+          this.ball.visible = true;
+          const f = turn.armFrames[idx];
+          this.ball.position.set(f.tipX, f.tipY, f.tipZ); // held at the tip
+        } else {
+          const bi = Math.min(turn.ballFrames.length - 1, idx - rel);
+          const bf = turn.ballFrames[bi];
+          if (bf) {
+            this.ball.visible = true;
+            this.ball.position.set(bf.ball.x, bf.ball.y, bf.ball.z);
+            this.ball.quaternion.set(bf.ball.qx, bf.ball.qy, bf.ball.qz, bf.ball.qw);
+            for (const cs of bf.cups) {
+              const g = this.cupMeshes[this.oppSide][cs.index];
+              if (g && !g.userData.dying) {
+                g.position.set(cs.x, cs.y, cs.z);
+                g.quaternion.set(cs.qx, cs.qy, cs.qz, cs.qw);
+              }
+            }
+          }
+          // Pop the made cup the moment the ball settles, then let the arm keep
+          // following through / returning to its ready pose.
+          if (!a.popped && turn.settleIndex >= 0 && idx >= turn.settleIndex) {
+            a.popped = true;
+            if (turn.outcome.result === 'sink' && turn.outcome.cupIndex >= 0) {
+              const g = this.cupMeshes[this.oppSide][turn.outcome.cupIndex];
+              if (g) g.userData.dying = true;
+              this.ball.visible = false;
+            }
+          }
         }
-        this._syncPhysics();
-        // ease shoulder and elbow back to rest while the ball is airborne
-        if (r.arm) r.arm.rotation.z += (restArmZ - r.arm.rotation.z) * Math.min(1, dt * 4);
-        if (r.hand) r.hand.rotation.z += (restHandZ - r.hand.rotation.z) * Math.min(1, dt * 4);
-        if (this.world.done) this._finishPhysics();
-      } else if (a.phase === 'settle') {
-        if (r.waist) r.waist.rotation.y += (0 - r.waist.rotation.y) * Math.min(1, dt * 5);
-        if (r.arm) r.arm.rotation.z += (restArmZ - r.arm.rotation.z) * Math.min(1, dt * 5);
-        if (r.hand) r.hand.rotation.z += (restHandZ - r.hand.rotation.z) * Math.min(1, dt * 5);
-        if (a.t >= a.settle) {
+        if (a.i >= a.armLen - 1) a.phase = 'end';
+      } else if (a.phase === 'end') {
+        // The made cup was already popped at settleIndex; if the program never
+        // fired or never settled, pop here as a fallback. Then report the outcome.
+        if (!a.popped) {
+          a.popped = true;
+          if (turn.outcome.result === 'sink' && turn.outcome.cupIndex >= 0) {
+            const g = this.cupMeshes[this.oppSide][turn.outcome.cupIndex];
+            if (g) g.userData.dying = true;
+          }
+          this.ball.visible = false;
+        }
+        a.settleT += dt;
+        if (a.settleT >= 0.4) {
           const cb = this.onTurnDone;
-          const outcome = a.outcome || { result: 'miss', cupIndex: -1 };
           this.anim = null; this.onTurnDone = null;
           if (this.ball) this.ball.visible = false;
-          if (cb) cb(outcome);
+          if (cb) cb(turn.outcome);
         }
       }
     }

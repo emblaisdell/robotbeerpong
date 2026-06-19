@@ -1,19 +1,25 @@
-// The match engine: pure simulation, no rendering. It assembles two RISC-V
-// players, runs a turn at a time, applies the inebriation handicap, resolves
-// throws through the physics module, and tracks the score. The view layer
-// consumes the per-turn events it returns; this whole file runs headless in
-// Node, which is how the game is smoke-tested.
+// The match engine. Each turn it runs the player as a real-time joint
+// controller: every tick (240 Hz) it refreshes the joint sensors, runs the
+// RISC-V program until it yields (ecall), reads the commanded motor torques,
+// and integrates the arm dynamics. When the program writes A_RELEASE the ball
+// leaves at the arm's true end-effector velocity, and the rigid-body cup
+// simulation takes over. The whole turn is simulated up front and recorded as a
+// timeline the view replays — deterministic and fully headless-testable.
 
 import { assemble, CPU } from './riscv.js';
 import { MMIO_EQU, getPlayer } from './players.js';
+import { Arm, ARM } from './arm.js';
+import { CupWorld } from './cupworld.js';
 import {
-  MEM_SIZE, MMIO_BASE, STACK_TOP, INSTR_BUDGET,
-  S_BEARING, S_RANGE, S_DRINKS, S_YAW, S_PITCH, S_GRAVITY, S_RNG, S_CUPS,
-  A_YAW, A_PITCH, A_POWER, A_FIRE, A_LOG, GRAVITY, MM_PER_UNIT,
+  MEM_SIZE, MMIO_BASE, STACK_TOP, CTRL, PHYS, GRAVITY, MM_PER_UNIT,
+  S_TICK, S_BEARING, S_RANGE, S_GRAVITY, S_YAW, S_YAW_VEL, S_SHOULDER,
+  S_SHOULDER_VEL, S_ELBOW, S_ELBOW_VEL, S_DRINKS, S_CUPS, S_RNG, S_ARMLEN, S_HELD,
+  A_TQ_YAW, A_TQ_SHOULDER, A_TQ_ELBOW, A_RELEASE, A_LOG,
 } from './constants.js';
-import { rackPositions, bearingRange, launchVelocity, originOf } from './physics.js';
+import { rackPositions, bearingRange, originOf } from './physics.js';
 
-// Deterministic PRNG so a given seed replays identically.
+const RAD2MRAD = 1000;
+
 function mulberry32(seed) {
   let a = seed >>> 0;
   return function () {
@@ -24,18 +30,18 @@ function mulberry32(seed) {
   };
 }
 
-// One robot: its assembled program, its rack (the cups it must defend), and how
-// many of its own cups have been sunk (= how drunk it is).
 class Robot {
-  constructor(label, side, playerId) {
-    this.label = label;       // 'A' / 'B'
-    this.side = side;         // -1 / +1
+  // `source` overrides the built-in program (used for the Custom editor). It may
+  // throw an assembler error, which the caller surfaces to the user.
+  constructor(label, side, playerId, source = null) {
+    this.label = label;
+    this.side = side;
     this.playerId = playerId;
-    const player = getPlayer(playerId);
-    this.player = player;
-    const { code } = assemble(player.source, MMIO_EQU);
-    this.code = code;         // clean image, reloaded every turn
+    this.player = getPlayer(playerId);
+    const { code } = assemble(source != null ? source : this.player.source, MMIO_EQU);
+    this.code = code;
     this.cpu = new CPU({ memSize: MEM_SIZE, mmioBase: MMIO_BASE, device: null });
+    this.arm = new Arm(side);
     this.cups = rackPositions(side);
     this.drinks = 0;
   }
@@ -44,171 +50,200 @@ class Robot {
 }
 
 export class Match {
-  constructor({ playerA = 'sniper', playerB = 'lobber', seed = 1 } = {}) {
-    this.rngState = (seed >>> 0) || 1;
-    this.rand = mulberry32(this.rngState);
-    this.robots = {
-      A: new Robot('A', -1, playerA),
-      B: new Robot('B', +1, playerB),
-    };
+  constructor({ playerA = 'sniper', playerB = 'lobber', seed = 1, srcA = null, srcB = null } = {}) {
+    this.rand = mulberry32((seed >>> 0) || 1);
+    this.robots = { A: new Robot('A', -1, playerA, srcA), B: new Robot('B', +1, playerB, srcB) };
     this.turnIndex = 0;
     this.current = 'A';
     this.winner = null;
-    this.log = [];
   }
 
   opponentOf(label) { return label === 'A' ? this.robots.B : this.robots.A; }
+  noise(stddev) { return (this.rand() + this.rand() + this.rand() - 1.5) * stddev * 0.8165; }
 
-  // Gaussian-ish noise (sum of uniforms), scaled by stddev.
-  noise(stddev) {
-    return (this.rand() + this.rand() + this.rand() - 1.5) * stddev * 0.8165;
-  }
-
-  // Build the device that backs MMIO for one turn. Sensor reads return noisy
-  // values (worse the drunker the robot); actuator writes are captured.
-  makeDevice(robot, target, drinks) {
-    const truth = bearingRange(robot.side, target);
-    const out = { yaw: 0, pitch: 0, power: 0, fired: false, logs: [] };
+  // Device backing the per-tick control ABI. Sensors read the live arm (with
+  // inebriation noise); torque/release writes are captured.
+  makeDevice(robot, truth, drinks) {
+    const arm = robot.arm;
+    const out = { tq: { yaw: 0, shoulder: 0, elbow: 0 }, release: false, logs: [] };
     const self = this;
-    const sensorBearingNoise = 18 * drinks; // mrad
-    const sensorRangeNoise = 90 * drinks;   // mm
+    const aN = 6 * drinks, vN = 40 * drinks;     // angle / rate sensor noise
     return {
       captured: out,
+      tick: 0,
+      held: 1,
       read32(addr) {
         switch (addr) {
-          case S_BEARING: return Math.round(truth.bearing + self.noise(sensorBearingNoise));
-          case S_RANGE: return Math.max(1, Math.round(truth.range + self.noise(sensorRangeNoise)));
-          case S_DRINKS: return drinks;
-          case S_YAW: return Math.round(self.noise(8 * drinks));
-          case S_PITCH: return Math.round(self.noise(8 * drinks));
+          case S_TICK: return this.tick;
+          case S_BEARING: return Math.round(truth.bearing + self.noise(18 * drinks));
+          case S_RANGE: return Math.max(1, Math.round(truth.range + self.noise(90 * drinks)));
           case S_GRAVITY: return GRAVITY * MM_PER_UNIT;
+          case S_YAW: return Math.round(arm.yaw.a * RAD2MRAD + self.noise(aN));
+          case S_YAW_VEL: return Math.round(arm.yaw.w * RAD2MRAD + self.noise(vN));
+          case S_SHOULDER: return Math.round(arm.shoulder.a * RAD2MRAD + self.noise(aN));
+          case S_SHOULDER_VEL: return Math.round(arm.shoulder.w * RAD2MRAD + self.noise(vN));
+          case S_ELBOW: return Math.round(arm.elbow.a * RAD2MRAD + self.noise(aN));
+          case S_ELBOW_VEL: return Math.round(arm.elbow.w * RAD2MRAD + self.noise(vN));
+          case S_DRINKS: return drinks;
           case S_CUPS: return self.opponentOf(robot.label).aliveCups().length;
           case S_RNG: return (self.rand() * 0xffffffff) | 0;
+          case S_ARMLEN: return Math.round((ARM.L1 + ARM.L2) * MM_PER_UNIT);
+          case S_HELD: return this.held;
           default: return 0;
         }
       },
       write32(addr, value) {
         switch (addr) {
-          case A_YAW: out.yaw = value | 0; break;
-          case A_PITCH: out.pitch = value | 0; break;
-          case A_POWER: out.power = value | 0; break;
-          case A_FIRE: if (value) out.fired = true; break;
+          case A_TQ_YAW: out.tq.yaw = value | 0; break;
+          case A_TQ_SHOULDER: out.tq.shoulder = value | 0; break;
+          case A_TQ_ELBOW: out.tq.elbow = value | 0; break;
+          case A_RELEASE: if (value) out.release = true; break;
           case A_LOG: out.logs.push(value | 0); break;
         }
       },
     };
   }
 
-  // Scribble on the program image to model corrupted memory / random byte flips.
-  // Tuned so total failure is rare and the result is comedic, not fatal.
+  // Scribble on the program image to model corrupted memory (drunk).
   corruptMemory(robot, drinks) {
     if (drinks <= 0) return 0;
     let flipped = 0;
-    const len = robot.cpu.mem.length;
-    // A few random byte flips anywhere in low memory (code + data).
-    const tries = drinks;
-    for (let i = 0; i < tries; i++) {
+    for (let i = 0; i < drinks; i++) {
       if (this.rand() < 0.10 * drinks) {
-        const addr = Math.floor(this.rand() * Math.min(len, 0x4000));
-        robot.cpu.mem[addr] = Math.floor(this.rand() * 256);
+        robot.cpu.mem[Math.floor(this.rand() * 0x4000)] = Math.floor(this.rand() * 256);
         flipped++;
       }
     }
     return flipped;
   }
 
-  // Run the player and produce the *launch* for this turn. The outcome (which
-  // cup, if any) is decided later by the rigid-body simulation and fed back via
-  // applyOutcome — the physics is the authority on whether a cup is made.
-  computeThrow() {
+  // Simulate one whole turn (control loop + ball physics) without mutating the
+  // score. Returns the timeline for the view plus the outcome.
+  simulateTurn() {
     if (this.winner) return null;
     const robot = this.robots[this.current];
     const opponent = this.opponentOf(this.current);
     const drinks = robot.drinks;
 
-    // Pick the nearest live opponent cup to aim at (fills the bearing sensor).
-    const origin = originOf(robot.side);
+    // Nearest live opponent cup (fills the bearing/range sensors).
+    const base = originOf(robot.side);
     const targets = opponent.aliveCups();
-    let target = targets[0];
-    let bestD = Infinity;
+    let target = targets[0], bestD = Infinity;
     for (const c of targets) {
-      const d = Math.hypot(c.x - origin.x, c.z - origin.z);
+      const d = Math.hypot(c.x - base.x, c.z - base.z);
       if (d < bestD) { bestD = d; target = c; }
     }
+    const truth = bearingRange(robot.side, target);
 
-    // Load a fresh program image, corrupt it, run the player.
+    // The arm is NOT reset between turns — it picks up from its last pose
+    // (continuous, no teleporting). Only the CPU/program is reloaded.
     robot.cpu.load(robot.code);
     const flipped = this.corruptMemory(robot, drinks);
-    const device = this.makeDevice(robot, target, drinks);
-    robot.cpu.device = device;
     robot.cpu.reset(0, STACK_TOP);
-    const ran = robot.cpu.run(INSTR_BUDGET);
-    const cmd = device.captured;
+    const dev = this.makeDevice(robot, truth, drinks);
+    robot.cpu.device = dev;
 
-    const event = {
+    const armFrames = [], ballFrames = [];
+    let released = false, releaseIndex = -1, settleIndex = -1, release = null, crashed = false, world = null;
+    let prevTau = { yaw: 0, shoulder: 0, elbow: 0 };
+    let ballAccum = 0;
+    const lagAlpha = 1 / (1 + 0.35 * drinks); // drunk -> laggier actuation
+    const POST = 1000;                        // max ticks after release (flight ~2.6s + settle + follow-through)
+
+    for (let tick = 0; tick < CTRL.maxTicks + POST; tick++) {
+      if (!released && tick >= CTRL.maxTicks) break; // never fired -> fizzle
+
+      dev.tick = tick;
+      robot.cpu.yielded = false;
+      robot.cpu.run(CTRL.perTickBudget);
+      if (robot.cpu.halted) { crashed = true; break; } // crashed -> arm goes limp
+
+      // Actuation handicap: scale error + bias + lag, all worse when drunk.
+      const cmd = dev.captured.tq;
+      const tau = {};
+      for (const k of ['yaw', 'shoulder', 'elbow']) {
+        const target = cmd[k] * (1 + this.noise(0.05 * drinks)) + this.noise(10 * drinks);
+        tau[k] = prevTau[k] + (target - prevTau[k]) * lagAlpha;
+      }
+      prevTau = tau;
+      robot.arm.step(tau, CTRL.dt);     // keep integrating even after release (follow-through)
+
+      const tip = robot.arm.tip();
+      armFrames.push({ ...robot.arm.state(), tipX: tip.x, tipY: tip.y, tipZ: tip.z, held: released ? 0 : 1 });
+
+      if (!released && dev.captured.release) {
+        released = true;
+        releaseIndex = armFrames.length - 1;
+        dev.held = 0;
+        release = { tip, vel: robot.arm.tipVelocity(), spin: robot.arm.spin() };
+        world = new CupWorld({ cups: opponent.aliveCups().map((c) => ({ index: c.index, x: c.x, z: c.z })) });
+        world.launch({ origin: release.tip, velocity: release.vel, spin: release.spin });
+      }
+
+      if (released) {
+        // Step the ball at its own rate (120 Hz) while the arm ticks at 240 Hz;
+        // record one ball frame per arm frame so the two timelines stay aligned.
+        // After the ball settles, world.step() is a no-op so the ball freezes
+        // while the arm keeps following through and returning to its ready pose.
+        ballAccum += CTRL.dt;
+        while (ballAccum >= PHYS.fixedDt - 1e-9 && !world.done) { world.step(); ballAccum -= PHYS.fixedDt; }
+        ballFrames.push({ ball: world.ballState(), cups: world.cupStates() });
+        if (world.done && settleIndex < 0) settleIndex = armFrames.length - 1;
+        // End once the ball has settled AND the arm is back at rest. The cap is
+        // generous (the ball launches from behind the robot, so its flight alone
+        // is ~2.6 s); a still-bouncing ball past the cap is finished by resolve().
+        const restful = Math.abs(robot.arm.shoulder.a) < 0.10 && Math.abs(robot.arm.shoulder.w) < 0.4;
+        if ((world.done && restful) || tick - releaseIndex > POST) break;
+      }
+    }
+    if (world && !world.done) world.resolve();
+    const outcome = world ? world.outcome : { result: 'miss', cupIndex: -1 };
+
+    // The recorded tail already eased the arm back to ~rest (shown to the
+    // viewer), so snap the engine state to exact rest. This keeps consecutive
+    // throws identical (no swing drift) while staying visually continuous —
+    // there's no teleport, the arm came home on screen.
+    robot.arm.reset();
+
+    return {
       turn: this.turnIndex,
       thrower: robot.label,
       side: robot.side,
       oppSide: opponent.side,
       playerId: robot.playerId,
       drinks,
-      origin,
-      target: { x: target.x, z: target.z },
-      instr: ran,
       corrupted: flipped,
-      log: cmd.logs.slice(),
+      crashed,
+      fired: released,
+      log: dev.captured.logs.slice(),
+      armFrames,
+      ballFrames,
+      releaseIndex,
+      settleIndex,
+      release,
+      outcome,
     };
-
-    if (!cmd.fired) {
-      // The program never pulled the trigger (corruption / crash / infinite
-      // loop). The arm twitches and fumbles the ball — physics will miss.
-      const yaw = Math.round(this.noise(400));
-      const power = Math.round(600 + this.rand() * 400);
-      event.fizzle = true;
-      event.command = { yawMrad: yaw, pitchMrad: 300, power };
-      event.velocity = launchVelocity(robot.side, yaw, 300, power);
-      return event;
-    }
-
-    // Actuator handicap: over/under-actuation (scale error) plus aim bias.
-    const yawMrad = Math.round(cmd.yaw * (1 + this.noise(0.02 * drinks)) + this.noise(20 * drinks));
-    const pitchMrad = Math.round(cmd.pitch + this.noise(14 * drinks));
-    const power = Math.max(0, Math.round(cmd.power * (1 + this.noise(0.05 * drinks))));
-    event.intended = { yawMrad: cmd.yaw, pitchMrad: cmd.pitch, power: cmd.power };
-    event.command = { yawMrad, pitchMrad, power };
-    event.velocity = launchVelocity(robot.side, yawMrad, pitchMrad, power);
-    return event;
   }
 
-  // Apply the physics result to the score and advance the turn.
-  //   result: { result: 'sink' | 'miss', cupIndex }
-  applyOutcome(result) {
-    const robot = this.robots[this.current];
+  // Apply a turn's outcome to the score and advance. Returns score info.
+  applyOutcome(outcome) {
     const opponent = this.opponentOf(this.current);
-    const info = { result: result.result, cupIndex: result.cupIndex, winner: null };
-
-    if (result.result === 'sink' && result.cupIndex >= 0) {
-      const cup = opponent.cups[result.cupIndex];
+    const info = { result: outcome.result, cupIndex: outcome.cupIndex, winner: null };
+    if (outcome.result === 'sink' && outcome.cupIndex >= 0) {
+      const cup = opponent.cups[outcome.cupIndex];
       if (cup && cup.alive) {
         cup.alive = false;
-        opponent.drinks += 1; // the victim drinks — and gets worse
-        info.sunkCup = { side: opponent.side, index: result.cupIndex, x: cup.x, z: cup.z };
+        opponent.drinks += 1;
+        info.sunkCup = { side: opponent.side, index: outcome.cupIndex };
         info.victim = opponent.label;
       }
     }
-
     if (opponent.defeated()) { this.winner = this.current; info.winner = this.current; }
     this.turnIndex++;
     this.current = this.current === 'A' ? 'B' : 'A';
     return info;
   }
 
-  // Live opponent cups (rack positions + indices) for building the physics world.
-  liveTargetCups() {
-    return this.opponentOf(this.current).aliveCups().map((c) => ({ index: c.index, x: c.x, z: c.z }));
-  }
-
-  // Convenience snapshot for the UI.
   state() {
     return {
       current: this.current,

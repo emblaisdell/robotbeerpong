@@ -1,0 +1,45 @@
+// minimal.rc — the smallest useful RobotC player.
+//
+// One control loop: keep the arm straight, wind the shoulder back, then drive a
+// fixed swing and release as it comes up through ~45 degrees. Aims dead ahead.
+// This is the "hello world" of the robot ABI: read sensors, write torques,
+// yield() once per tick, persist state in globals.
+
+const int WINDBACK     = -1450;   // mrad the shoulder cocks back to
+const int RELEASE_ANGLE = -785;   // mrad: let go as we swing up through here
+const int SWING_SPEED   = 2780;   // target shoulder angular velocity (mrad/s)
+
+int phase;   // 0 = wind back, 1 = swing, 2 = done  (persists across ticks)
+
+// PD term: torque = (kp*err - kd*rate) / 1000
+int pd(int err, int rate, int kp, int kd) {
+    return (kp * err - kd * rate) / 1000;
+}
+
+void main() {
+    phase = 0;
+    while (1) {
+        // elbow: hold straight (target 0)
+        write(A_TQ_ELBOW, pd(-read(S_ELBOW), read(S_ELBOW_VEL), 220, 40));
+        // yaw: hold dead ahead (target 0)
+        write(A_TQ_YAW, pd(-read(S_YAW), read(S_YAW_VEL), 200, 40));
+
+        int sh  = read(S_SHOULDER);
+        int shv = read(S_SHOULDER_VEL);
+        int st;
+        if (phase == 0) {
+            st = pd(WINDBACK - sh, shv, 260, 50);
+            if (sh <= WINDBACK + 120) phase = 1;
+        } else if (phase == 1) {
+            st = (SWING_SPEED - shv) * 120 / 1000;
+            if (sh >= RELEASE_ANGLE && shv > 0) {
+                write(A_RELEASE, 1);
+                phase = 2;
+            }
+        } else {
+            st = 0;
+        }
+        write(A_TQ_SHOULDER, st);
+        yield();   // end this tick; resume here next tick with globals intact
+    }
+}

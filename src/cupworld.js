@@ -71,24 +71,11 @@ export class CupWorld {
     ground.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
     world.addBody(ground);
 
-    // Backstop: an invisible wall just in front of the *target* robot (behind
-    // its rack) so overshot balls stop there instead of phasing through the
-    // robot, which has no collider. Only on the opponent's side — a wall in
-    // front of the thrower would block its own launch. Low restitution so it
-    // deadens the ball rather than ricocheting it back across the table.
-    // The opponent's side (+1 / -1): the ball travels toward it.
-    this.oppSide = cups.length ? (Math.sign(cups[0].z) || 1) : 1;
+    // Backstop plane: there is no physical wall. The robots have no colliders,
+    // so once the ball reaches this z-plane (just in front of a robot) we simply
+    // end the simulation as a miss — no cup is removed — rather than let the
+    // ball phase through the robot.
     this.backstopZ = COURT.robotZ - COURT.backstopInset;
-    if (cups.length) {
-      const oppSide = this.oppSide;
-      const wallMat = new CANNON.Material('wall');
-      world.addContactMaterial(new CANNON.ContactMaterial(ballMat, wallMat, { restitution: 0.1, friction: 0.5 }));
-      const hy = COURT.backstopHeight / 2;
-      const wall = new CANNON.Body({ mass: 0, material: wallMat });
-      wall.addShape(new CANNON.Box(new CANNON.Vec3(COURT.tableHalfWidth + 2, hy, 0.25)));
-      wall.position.set(0, hy, oppSide * (COURT.robotZ - COURT.backstopInset));
-      world.addBody(wall);
-    }
 
     this.ballMat = ballMat;
     this.cups = [];
@@ -101,6 +88,7 @@ export class CupWorld {
 
     this.ball = null;
     this.restCount = 0;
+    this.inCupCount = 0;
     this.steps = 0;
     this.done = false;
     this.outcome = null;
@@ -141,10 +129,17 @@ export class CupWorld {
     }
 
     const speed = b.velocity.length();
-    if (speed < PHYS.restSpeed) this.restCount++; else this.restCount = 0;
 
+    // Early sink: the ball has dropped into a cup's mouth (below the rim, inside
+    // the inner wall) and is slowing — it can't escape, so call it now instead
+    // of waiting for it to fully stop bouncing.
+    const captured = this._cupContaining(b.position, true);
+    if (captured >= 0 && speed < 6) this.inCupCount++; else this.inCupCount = 0;
+    if (this.inCupCount >= 12) return this._finish('sink', captured);
+
+    if (speed < PHYS.restSpeed) this.restCount++; else this.restCount = 0;
     if (this.restCount >= PHYS.restFrames || this.steps >= PHYS.maxSteps) {
-      // Settled. Inside a (still-upright) cup?
+      // Settled elsewhere — inside a cup counts as a sink, otherwise a miss.
       const made = this._cupContaining(b.position);
       if (made >= 0) return this._finish('sink', made);
       return this._finish('miss', -1);
@@ -152,17 +147,19 @@ export class CupWorld {
     return 'flying';
   }
 
-  _cupContaining(p) {
-    if (p.y > CUP_PHYS.rimY || p.y < 0) return -1;
+  // Which live, upright cup contains the ball point. `strict` (used for the
+  // early-sink test) requires the ball clearly below the rim and within the
+  // inner wall; the lenient form (final settle) allows the rim margin.
+  _cupContaining(p, strict = false) {
+    const ceil = strict ? CUP_PHYS.rimY - 0.3 : CUP_PHYS.rimY;
+    const radius = strict ? CUP_PHYS.innerR : CUP_PHYS.innerR + BALL_RADIUS;
+    if (p.y > ceil || p.y < 0) return -1;
     for (const c of this.cups) {
-      // Use the cup's *current* position (it may have been nudged).
       const cp = c.body.position;
-      // Only count cups still roughly upright.
       const up = new CANNON.Vec3(0, 1, 0);
       c.body.quaternion.vmult(up, up);
-      if (up.y < 0.6) continue;
-      const d = Math.hypot(p.x - cp.x, p.z - cp.z);
-      if (d <= CUP_PHYS.innerR + BALL_RADIUS) return c.index;
+      if (up.y < 0.6) continue; // only cups still roughly upright
+      if (Math.hypot(p.x - cp.x, p.z - cp.z) <= radius) return c.index;
     }
     return -1;
   }

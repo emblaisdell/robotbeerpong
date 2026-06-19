@@ -3,87 +3,148 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" type="image/png" href="favicon.png" />
   <title>Robot Beer Pong</title>
   <style>
-    :root { --bg:#10131a; --panel:#181c26; --ink:#e8edf6; --muted:#8a93a6; --accent:#5b8cff; --warn:#ff6b6b; --good:#3ddc97; }
+    :root {
+      --bg:#0f1115; --panel:#1b1f26; --panel2:#232832; --edge:#3a4150;
+      --ink:#d8dee9; --muted:#828c9c; --accent:#ff9f1c; --accent2:#ffb84d;
+      --warn:#ff5a52; --good:#56d364; --term:#9ad07a;
+      --bevel: inset 0 1px 0 #ffffff12, inset 0 -1px 0 #00000070, 0 1px 2px #0007;
+    }
     * { box-sizing: border-box; }
     html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
       font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
-    #app { display: grid; grid-template-columns: 320px 1fr; height: 100vh; }
-    #sidebar { background: var(--panel); border-right: 1px solid #0008; padding: 16px; overflow-y: auto; }
-    #stage { position: relative; }
+    #app { display: grid; grid-template-columns: 360px 1fr; height: 100vh; }
+    #sidebar { background: linear-gradient(180deg, #1d222b, #171b22);
+      border-right: 2px solid #0a0c10; padding: 14px; overflow-y: auto; }
+    #sidebar::-webkit-scrollbar { width: 10px; }
+    #sidebar::-webkit-scrollbar-thumb { background: #2c3340; border-radius: 5px; }
+    #stage { position: relative; background: #0b0d11; }
     #canvas { position: absolute; inset: 0; }
-    h1 { font-size: 18px; margin: 0 0 2px; letter-spacing: 0.5px; }
-    .sub { color: var(--muted); font-size: 11px; margin-bottom: 16px; }
-    .group { margin-bottom: 16px; }
-    label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
-    select, button { width: 100%; font-family: inherit; font-size: 13px; padding: 8px 10px;
-      background: #222838; color: var(--ink); border: 1px solid #333b4d; border-radius: 6px; cursor: pointer; }
-    button.primary { background: var(--accent); border-color: var(--accent); color: #08101f; font-weight: 700; }
-    button:disabled { opacity: 0.5; cursor: default; }
+
+    /* Header */
+    h1 { font-size: 17px; margin: 0; letter-spacing: 1px; text-transform: uppercase; display: flex; align-items: center; gap: 8px; }
+    .hazard { height: 6px; margin: 8px 0 4px;
+      background: repeating-linear-gradient(45deg, var(--accent), var(--accent) 9px, #14161a 9px, #14161a 18px);
+      border-radius: 2px; opacity: 0.85; }
+    .sub { color: var(--muted); font-size: 10.5px; margin-bottom: 14px; line-height: 1.5; }
+
+    /* Section labels */
+    label, .seclabel { display: block; font-size: 10px; color: var(--accent2); margin-bottom: 5px;
+      text-transform: uppercase; letter-spacing: 1.5px; }
+    label::before, .seclabel::before { content: "▸ "; color: var(--accent); }
+
+    /* Panels / controls */
+    .group { margin-bottom: 14px; }
+    select, button, textarea { font-family: inherit; }
+    select, button { width: 100%; font-size: 13px; padding: 9px 10px; color: var(--ink);
+      background: linear-gradient(180deg, var(--panel2), var(--panel));
+      border: 1px solid var(--edge); border-radius: 5px; cursor: pointer; box-shadow: var(--bevel); }
+    select:focus, textarea:focus { outline: 1px solid var(--accent); }
+    button.primary { background: linear-gradient(180deg, var(--accent2), var(--accent));
+      border-color: #b56f00; color: #2a1800; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
+    button:active { box-shadow: inset 0 2px 4px #0008; }
+    button:disabled { opacity: 0.45; cursor: default; }
     .row { display: flex; gap: 8px; }
     .row > * { flex: 1; }
-    .blurb { font-size: 10px; color: var(--muted); margin-top: 4px; min-height: 26px; }
-    .scoreboard { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
-    .card { background: #1f2533; border: 1px solid #2c3346; border-radius: 8px; padding: 10px; }
-    .card.turn { outline: 2px solid var(--accent); }
-    .card h3 { margin: 0 0 6px; font-size: 13px; }
-    .card .who { color: var(--muted); font-size: 10px; }
-    .cups { display: flex; flex-wrap: wrap; gap: 3px; margin: 6px 0; }
-    .pip { width: 12px; height: 12px; border-radius: 50%; background: #3ddc97; }
-    .pip.gone { background: #333b4d; }
-    .drinks { font-size: 11px; color: var(--warn); }
+    .blurb { font-size: 10px; color: var(--muted); margin-top: 5px; min-height: 24px; line-height: 1.4; }
+
+    /* Scoreboard — metal placards with status LED + triangle rack */
+    .scoreboard { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 6px 0 16px; }
+    .card { background: linear-gradient(180deg, #232a34, #1a1f27);
+      border: 1px solid var(--edge); border-radius: 6px; padding: 10px; box-shadow: var(--bevel); position: relative; }
+    .card.turn { border-color: var(--accent); box-shadow: var(--bevel), 0 0 0 1px var(--accent), 0 0 12px #ff9f1c44; }
+    .card h3 { margin: 0 0 2px; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; display: flex; align-items: center; gap: 6px; }
+    .led { width: 8px; height: 8px; border-radius: 50%; background: #444; box-shadow: inset 0 0 2px #000; }
+    .card.turn .led { background: var(--good); box-shadow: 0 0 6px var(--good); }
+    .card .who { color: var(--muted); font-size: 9.5px; }
+    .rack { display: flex; flex-direction: column; align-items: center; gap: 3px; margin: 8px 0 6px; }
+    .rack .rrow { display: flex; gap: 4px; }
+    .pip { width: 12px; height: 12px; border-radius: 50%; background: #d63031;
+      box-shadow: inset 0 1px 1px #ffffff66, inset 0 -2px 2px #00000055, 0 1px 1px #0007; }
+    .pip.gone { background: #20242b; box-shadow: inset 0 1px 3px #000a; }
+    .drinks { font-size: 10.5px; color: var(--accent2); min-height: 14px; }
     .drinks .sober { color: var(--muted); }
-    #log { font-size: 11px; line-height: 1.5; color: var(--muted); white-space: pre-wrap;
-      background: #11151d; border: 1px solid #222838; border-radius: 6px; padding: 8px; height: 200px; overflow-y: auto; }
-    #log b { color: var(--ink); }
-    #log .sink { color: var(--good); }
-    #log .fizzle { color: var(--warn); }
+
+    /* Custom code editor */
+    .custom { display: none; margin-top: 8px; }
+    .custom.show { display: block; }
+    .custom textarea { width: 100%; height: 240px; resize: vertical; padding: 8px;
+      font: 11px/1.45 ui-monospace, Menlo, Consolas, monospace; white-space: pre; overflow: auto;
+      tab-size: 4; color: var(--term); background: #0a0c10; border: 1px solid var(--edge); border-radius: 5px;
+      box-shadow: inset 0 2px 6px #000a; }
+    .custom .ctrls { display: flex; gap: 8px; margin-top: 6px; align-items: center; }
+    .custom .ctrls button { width: auto; padding: 6px 12px; font-size: 11px; }
+    .status { font-size: 10px; min-height: 14px; flex: 1; }
+    .status.ok { color: var(--good); } .status.err { color: var(--warn); white-space: pre-wrap; }
+    .hint { font-size: 9.5px; color: var(--muted); margin-top: 6px; }
+    .hint a { color: var(--accent2); }
+
+    /* Speed + log */
     .speed { display: flex; gap: 6px; }
-    .speed button.active { background: var(--accent); color: #08101f; border-color: var(--accent); }
+    .speed button.active { background: linear-gradient(180deg, var(--accent2), var(--accent)); color: #2a1800; border-color: #b56f00; }
+    #log { font-size: 10.5px; line-height: 1.55; color: var(--muted); white-space: pre-wrap;
+      background: #0c0e12; border: 1px solid var(--edge); border-radius: 5px; padding: 8px; height: 190px;
+      overflow-y: auto; box-shadow: inset 0 2px 6px #0008; }
+    #log b { color: var(--ink); } #log .sink { color: var(--good); } #log .fizzle { color: var(--warn); }
+
     #banner { position: absolute; top: 20px; left: 50%; transform: translateX(-50%); z-index: 5;
-      background: #000a; border: 1px solid #2c3346; border-radius: 10px; padding: 10px 18px; font-size: 14px;
-      pointer-events: none; opacity: 0; transition: opacity 0.25s; }
+      background: linear-gradient(180deg, #232a34, #14181f); border: 1px solid var(--accent);
+      border-radius: 8px; padding: 10px 20px; font-size: 14px; letter-spacing: 0.5px; color: var(--accent2);
+      box-shadow: 0 4px 20px #000a; pointer-events: none; opacity: 0; transition: opacity 0.25s; }
     #banner.show { opacity: 1; }
-    a { color: var(--accent); }
+    a { color: var(--accent2); }
   </style>
 </head>
 <body>
   <div id="app">
     <aside id="sidebar">
-      <h1>🤖🍺 Robot Beer Pong</h1>
-      <div class="sub">Two bare-metal RISC-V robots play beer pong. Losing cups gets you drunk — and drunk robots throw worse.</div>
+      <h1>Robot Beer Pong</h1>
+      <div class="hazard"></div>
+      <div class="sub">Two bare-metal RISC-V robots play beer pong. Each writes motor torques to its arm
+        joints every tick — losing cups gets you drunk, and drunk robots throw worse.</div>
 
       <div class="scoreboard">
         <div class="card" id="cardA">
-          <h3>Robot A <span class="who" id="whoA"></span></h3>
-          <div class="cups" id="cupsA"></div>
+          <h3><span class="led"></span>Unit A <span class="who" id="whoA"></span></h3>
+          <div class="rack" id="cupsA"></div>
           <div class="drinks" id="drinksA"></div>
         </div>
         <div class="card" id="cardB">
-          <h3>Robot B <span class="who" id="whoB"></span></h3>
-          <div class="cups" id="cupsB"></div>
+          <h3><span class="led"></span>Unit B <span class="who" id="whoB"></span></h3>
+          <div class="rack" id="cupsB"></div>
           <div class="drinks" id="drinksB"></div>
         </div>
       </div>
 
       <div class="group">
-        <label>Robot A — strategy</label>
+        <label>Unit A — firmware</label>
         <select id="selA"></select>
         <div class="blurb" id="blurbA"></div>
+        <div class="custom" id="customA">
+          <textarea id="srcA" spellcheck="false"></textarea>
+          <div class="ctrls"><button id="checkA">⚙ Assemble</button><span class="status" id="statusA"></span></div>
+        </div>
       </div>
       <div class="group">
-        <label>Robot B — strategy</label>
+        <label>Unit B — firmware</label>
         <select id="selB"></select>
         <div class="blurb" id="blurbB"></div>
+        <div class="custom" id="customB">
+          <textarea id="srcB" spellcheck="false"></textarea>
+          <div class="ctrls"><button id="checkB">⚙ Assemble</button><span class="status" id="statusB"></span></div>
+        </div>
+        <div class="hint">Write RV32IM that drives the arm joints. ABI &amp; example:
+          <a href="docs/robot-isa.md" target="_blank">docs/robot-isa.md</a></div>
       </div>
 
       <div class="group row">
-        <button class="primary" id="btnPlay">▶ Play match</button>
+        <button class="primary" id="btnPlay">▶ Run match</button>
         <button id="btnStep">Step</button>
       </div>
       <div class="group">
-        <label>Speed</label>
+        <label>Playback rate</label>
         <div class="speed" id="speed">
           <button data-s="0.5">0.5×</button>
           <button data-s="1" class="active">1×</button>
@@ -93,10 +154,10 @@
       </div>
 
       <div class="group">
-        <label>Play-by-play</label>
+        <label>Telemetry</label>
         <div id="log"></div>
       </div>
-      <div class="sub">Tip: drag to orbit, scroll to zoom. Each throw is real RV32IM machine code executed in your browser.</div>
+      <div class="sub">Drag to orbit · scroll to zoom. Every throw is real RV32IM machine code executed in your browser.</div>
     </aside>
 
     <main id="stage">

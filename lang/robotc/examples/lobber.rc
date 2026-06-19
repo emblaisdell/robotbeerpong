@@ -1,0 +1,54 @@
+// lobber.rc — RobotC port of the hand-written LOBBER (src/players.js).
+//
+// Skips the square root: a cheap linear fit maps range straight to the target
+// shoulder speed. Same PD swing as Sniper, but sturdier under noise because the
+// model has no fragile precision to lose.
+
+const int WINDBACK      = -1450;
+const int RELEASE_ANGLE = -785;
+const int ELBOW_COCK    = 1100;
+
+int phase;
+int wstar;
+int yawTarget;
+
+void main() {
+    int range = read(S_RANGE);
+    yawTarget = read(S_BEARING);
+
+    // wstar = range*294/1000 + 1374   (linear tip-speed model)
+    wstar = range * 294 / 1000 + 1374;
+    phase = 0;
+
+    while (1) {
+        int yaw  = read(S_YAW);
+        int yawv = read(S_YAW_VEL);
+        write(A_TQ_YAW, ((yawTarget - yaw) * 200 - yawv * 40) / 1000);
+
+        int et = 0;
+        if (phase == 0) et = ELBOW_COCK;
+        int el  = read(S_ELBOW);
+        int elv = read(S_ELBOW_VEL);
+        write(A_TQ_ELBOW, ((et - el) * 220 - elv * 40) / 1000);
+
+        int sh  = read(S_SHOULDER);
+        int shv = read(S_SHOULDER_VEL);
+        int st;
+        if (phase == 0) {
+            st = ((WINDBACK - sh) * 260 - shv * 50) / 1000;
+            // advance only when wound back AND the shoulder has settled
+            if (sh <= WINDBACK + 120 && shv <= 250 && shv >= -250) phase = 1;
+        } else if (phase == 1) {
+            st = (wstar - shv) * 120 / 1000;
+            if (sh >= RELEASE_ANGLE && shv > 0) {
+                write(A_RELEASE, 1);
+                phase = 2;
+            }
+        } else {
+            // follow-through: ease the shoulder back toward a ready pose
+            st = ((0 - sh) * 200 - shv * 40) / 1000;
+        }
+        write(A_TQ_SHOULDER, st);
+        yield();
+    }
+}

@@ -239,12 +239,17 @@ function encodeInstr(op, args, at, val) {
     case 'li': {
       need(2);
       const v = val(args[1]) | 0;
-      return encodeLi(R(0), v);
+      // Stay aligned with pass-1 sizing (pseudoWords): a bare numeric literal
+      // may shrink to one word, but a symbol operand was reserved two words, so
+      // force two when the operand isn't a plain number.
+      return parseMaybe(args[1]) !== null ? encodeLi(R(0), v) : encodeLi2(R(0), v);
     }
     case 'la': {
       need(2);
       // flat address space and small images: just materialize the constant.
-      return encodeLi(R(0), val(args[1]) | 0);
+      // Always two words (lui+addi) to match the pass-1 reservation, even when
+      // the address happens to fit in 12 bits.
+      return encodeLi2(R(0), val(args[1]) | 0);
     }
     case 'j': { need(1); const off = val(args[0]) - at; return [encJ(off, 0, 0x6f)]; }
     case 'jr': { need(1); return [encI(0, R(0), 0x0, 0, 0x67)]; }
@@ -301,8 +306,14 @@ function encodeInstr(op, args, at, val) {
 
 function encodeLi(rd, v) {
   if (v >= -2048 && v <= 2047) return [encI(v, 0, 0x0, rd, 0x13)]; // addi rd,x0,v
+  return encodeLi2(rd, v);
+}
+
+// Always materialize `v` in two words (lui+addi). Used where the assembler has
+// already reserved two words (la, and li of a symbol whose value may be small).
+function encodeLi2(rd, v) {
   // lui takes bits 31:12; addi adds the sign-extended low 12. Adjust hi for borrow.
-  let hi = (v + 0x800) >>> 12;
+  const hi = (v + 0x800) >>> 12;
   const lo = v - (hi << 12);
   return [encU(hi << 12, rd, 0x37), encI(lo, rd, 0x0, rd, 0x13)];
 }
@@ -328,8 +339,9 @@ export class CPU {
     this.mmioBase = mmioBase >>> 0;
     this.mmioEnd = (mmioBase + mmioSize) >>> 0;
     this.device = device;       // { read32(addr), write32(addr, value) }
-    this.halted = false;
-    this.haltCode = 0;          // a0 at ecall
+    this.halted = false;        // ebreak / illegal instruction — program crashed
+    this.yielded = false;       // ecall — cooperative yield to the next tick
+    this.haltCode = 0;          // a0 at the trap
     this.instret = 0;
   }
 
@@ -342,6 +354,7 @@ export class CPU {
     this.x[2] = sp | 0; // sp
     this.pc = pc >>> 0;
     this.halted = false;
+    this.yielded = false;
     this.haltCode = 0;
     this.instret = 0;
   }
@@ -363,10 +376,12 @@ export class CPU {
   store16(a, v) { a >>>= 0; this.mem[a] = v; this.mem[a + 1] = v >>> 8; }
   store8(a, v) { a >>>= 0; this.mem[a] = v; }
 
-  // Run up to `budget` instructions or until halted. Returns instructions run.
+  // Run up to `budget` instructions, or until the program crashes (halted) or
+  // cooperatively yields (ecall). The caller clears `yielded` and calls again to
+  // resume on the next tick. Returns instructions run this slice.
   run(budget) {
     let n = 0;
-    while (n < budget && !this.halted) { this.step(); n++; }
+    while (n < budget && !this.halted && !this.yielded) { this.step(); n++; }
     return n;
   }
 
@@ -477,9 +492,9 @@ export class CPU {
         }
         break;
       }
-      case 0x73: {                                           // SYSTEM (ecall/ebreak)
-        this.halted = true;
-        this.haltCode = x[10]; // a0
+      case 0x73: {                                           // SYSTEM
+        if ((inst >>> 20) === 0) this.yielded = true;        // ECALL -> yield one tick
+        else { this.halted = true; this.haltCode = x[10]; }  // EBREAK -> crash
         break;
       }
       default:

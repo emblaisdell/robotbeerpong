@@ -1,42 +1,38 @@
-// Headless match simulation — verifies the players actually play, with the
-// rigid-body cup physics deciding outcomes. Run: node tools/test-engine.mjs
+// Headless match simulation — the RISC-V joint controllers drive the real arm
+// dynamics, and the rigid-body cup physics decides outcomes.
+// Run: node tools/test-engine.mjs
 import { Match } from '../src/engine.js';
 import { PLAYERS } from '../src/players.js';
-import { CupWorld } from '../src/cupworld.js';
 
-// Resolve one turn end-to-end: compute the launch, run the physics, score it.
 function resolveTurn(m) {
-  const ev = m.computeThrow();
-  if (!ev) return null;
-  const world = new CupWorld({ cups: m.liveTargetCups() });
-  world.launch({ origin: ev.origin, velocity: ev.velocity });
-  const outcome = world.resolve();
-  const info = m.applyOutcome(outcome);
-  return { ev, info };
+  const r = m.simulateTurn();
+  if (!r) return null;
+  const info = m.applyOutcome(r.outcome);
+  return { r, info };
 }
 
-// 1) Sober accuracy: with drinks pinned to 0, each strategy should clear a
-// 6-cup rack in a reasonable number of throws (opponent never fires back).
+// 1) Sober accuracy: drinks pinned to 0, each controller should clear the rack.
 function soloAccuracy(playerId, maxTurns = 40) {
   const m = new Match({ playerA: playerId, playerB: playerId, seed: 7 });
-  let sinks = 0, throws = 0;
+  let sinks = 0, throws = 0, fired = 0;
   for (let i = 0; i < maxTurns && !m.robots.B.defeated(); i++) {
     m.current = 'A';
-    m.robots.A.drinks = 0; // keep sober for the accuracy probe
-    const r = resolveTurn(m);
+    m.robots.A.drinks = 0;
+    const { r, info } = resolveTurn(m);
     throws++;
-    if (r.info.result === 'sink') sinks++;
+    if (r.fired) fired++;
+    if (info.result === 'sink') sinks++;
   }
-  return { sinks, throws, cleared: m.robots.B.defeated() };
+  return { sinks, throws, fired, cleared: m.robots.B.defeated() };
 }
 
-console.log('Sober solo accuracy (clearing a 6-cup rack, real physics):');
+console.log('Sober solo accuracy (torque-control swing, real physics):');
 for (const p of PLAYERS) {
   const r = soloAccuracy(p.id);
-  console.log(`  ${p.name.padEnd(7)} sank ${r.sinks}/6 in ${r.throws} throws  cleared=${r.cleared}`);
+  console.log(`  ${p.name.padEnd(7)} sank ${r.sinks}/6 in ${r.throws} throws (fired ${r.fired})  cleared=${r.cleared}`);
 }
 
-// 2) Head-to-head across seeds: terminate with a winner + believable drinks.
+// 2) Head-to-head across seeds.
 console.log('\nHead-to-head (Sniper vs Lobber), 5 seeds:');
 let aWins = 0, bWins = 0;
 for (let seed = 1; seed <= 5; seed++) {
@@ -56,9 +52,8 @@ for (const a of PLAYERS) for (const b of PLAYERS) {
   const m = new Match({ playerA: a.id, playerB: b.id, seed: 3 });
   let guard = 0;
   while (!m.winner && guard < 800) { resolveTurn(m); guard++; }
-  const done = !!m.winner;
-  ok = ok && done;
-  console.log(`  ${a.name} vs ${b.name}: ${done ? 'winner ' + m.winner : 'NO WINNER'} in ${m.turnIndex} turns`);
+  ok = ok && !!m.winner;
+  console.log(`  ${a.name} vs ${b.name}: ${m.winner ? 'winner ' + m.winner : 'NO WINNER'} in ${m.turnIndex} turns`);
 }
 console.log(ok ? '\nAll matches terminated.' : '\nSOME MATCHES HUNG');
 process.exit(ok ? 0 : 1);
